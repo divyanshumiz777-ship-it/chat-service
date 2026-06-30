@@ -1,0 +1,12 @@
+INFO:     Started server process [39880]
+INFO:     Waiting for application startup.
+2026-06-24 19:27:05,523 INFO chat-service starting chat-service (env=development)
+2026-06-24 19:27:06,542 INFO httpx HTTP Request: GET http://localhost:6333/collections/content_public/exists "HTTP/1.1 200 OK"
+2026-06-24 19:27:06,556 INFO httpx HTTP Request: GET http://localhost:6333/collections/content_private/exists "HTTP/1.1 200 OK"
+2026-06-24 19:27:06,557 INFO chat-service Qdrant collections initialized
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8002 (Press CTRL+C to quit)
+2026-06-24 19:27:31,796 INFO chat-service.api.internal chat user=69cc2255712acfd7c4927113 intent=Intent.SUGGEST_CREATORS msg_len=16
+2026-06-24 19:29:09,868 INFO chat-service.api.internal chat user=0000000000000000deadbeef intent=Intent.SUGGEST_CREATORS msg_len=16
+2026-06-24 19:45:10,953 INFO chat-service.api.internal chat user=69cc28e57bf9957c357c4150 intent=Intent.SUGGEST_COMMUNITIES msg_len=19
+2026-06-24 19:45:37,865 INFO chat-service.api.internal chat user=69cc28e57bf9957c357c4150 intent=Intent.SUGGEST_COMMUNITIES msg_len=15

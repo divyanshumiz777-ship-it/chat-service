@@ -1,0 +1,23 @@
+# AI Chat Service — Batch 14A (skeleton) dependencies.
+# Web framework + runtime only. The RAG/AI stack (qdrant-client,
+# sentence-transformers, google-generativeai), and data clients (motor, redis)
+# are introduced in their own batches to keep the skeleton image small.
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Data clients (readiness checks; data access wired in later batches)
+redis==5.2.1
+motor==3.6.0
+
+# Vector DB client (collection bootstrap + readiness; vectors/search wired later)
+qdrant-client==1.12.1
+
+# Embedding model (lazy-loaded on first use)
+sentence-transformers==3.3.1
+
+# Groq generation (lazy-loaded; requires GROQ_API_KEY at runtime).
+# Official SDK — supports native async via AsyncGroq (OpenAI-compatible API).
+groq>=0.11,<1.0
