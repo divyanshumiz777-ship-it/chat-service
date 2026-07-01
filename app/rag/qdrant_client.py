@@ -32,7 +32,10 @@ def get_client() -> Any:
     if _client is None:
         from qdrant_client import AsyncQdrantClient
 
-        _client = AsyncQdrantClient(url=settings.qdrant_url)
+        _client = AsyncQdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key or None,
+        )
     return _client
 
 

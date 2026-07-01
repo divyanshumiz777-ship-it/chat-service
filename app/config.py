@@ -39,6 +39,7 @@ class Settings(BaseSettings):
 
     # Qdrant (vector DB). Client + collection bootstrap live in app/rag.
     qdrant_url: str = "http://qdrant:6333"
+    qdrant_api_key: str = ""  # required for Qdrant Cloud; leave empty for local
     qdrant_collection_public: str = "content_public"
     qdrant_collection_private: str = "content_private"
     qdrant_vector_size: int = 384  # all-MiniLM-L6-v2 dimensionality
