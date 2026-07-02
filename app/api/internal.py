@@ -50,6 +50,7 @@ from app.tools import (
     get_my_communities,
     get_my_friends,
     get_social_overview,
+    get_trending_creators,
     lookup_conversation_with,
     lookup_my_community,
     search_users,
@@ -139,6 +140,11 @@ _RECOMMENDERS = {
         suggest_creators, "creators", "🎬 Suggested creators for you:",
         "I couldn't find any creator recommendations yet. As more users and reels "
         "are added, I'll be able to suggest relevant creators.",
+    ),
+    Intent.TRENDING_CREATORS: (
+        get_trending_creators, "creators", "🔥 Trending creators right now:",
+        "I couldn't find any trending creators yet. Once people start following "
+        "creators, I'll be able to show who's growing fastest.",
     ),
 }
 

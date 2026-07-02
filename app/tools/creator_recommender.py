@@ -46,11 +46,18 @@ async def suggest_creators(user_id: str, limit: int = 5) -> list[dict]:
 
     pref = await db["userreelpreferences"].find_one(
         {"user_id": me_oid},
-        {"preferred_tags": 1, "followed_creators": 1, "muted_creators": 1},
+        {"preferred_tags": 1, "muted_creators": 1},
     )
     my_tags = {t.lower() for t in (pref.get("preferred_tags") or [])} if pref else set()
-    following = oid_set(pref.get("followed_creators")) if pref else set()
     muted = oid_set(pref.get("muted_creators")) if pref else set()
+
+    # Real follow graph (Follow.ts) — userreelpreferences.followed_creators
+    # was a dead field with no writer anywhere in the codebase.
+    following: set = set()
+    async for doc in db["follows"].find({"follower": me_oid}, {"followee": 1}):
+        f = to_oid(doc.get("followee"))
+        if f:
+            following.add(f)
 
     excluded = {me_oid} | following | muted | my_blocked
 
@@ -103,13 +110,19 @@ async def suggest_creators(user_id: str, limit: int = 5) -> list[dict]:
 
     names: dict = {}
     async for u in db["users"].find(
-        {"_id": {"$in": list(stats.keys())}}, {"name": 1, "profilePic": 1}
+        {"_id": {"$in": list(stats.keys())}}, {"name": 1, "profilePic": 1, "blockedUsers": 1}
     ):
+        # Reverse-block: this candidate has blocked me. My_blocked (candidate
+        # blocked by me) is already excluded earlier via `excluded`.
+        if me_oid in oid_set(u.get("blockedUsers")):
+            continue
         names[u["_id"]] = u
 
     # ── Score ─────────────────────────────────────────────────────────────────
     results: list[dict] = []
     for cid, st in stats.items():
+        if cid not in names:
+            continue
         score = 0
         reasons: list[str] = []
 

@@ -124,11 +124,10 @@ async def _get_social_overview_impl(user_id: str) -> dict:
             if creator_doc:
                 most_active_creator = creator_doc.get("name")
 
-    # ── Followed creators count ──────────────────────────────────────────────────
-    pref = await db["userreelpreferences"].find_one(
-        {"user_id": me_oid}, {"followed_creators": 1}
+    # ── Followed creators count (real Follow graph) ───────────────────────────────
+    creators_count = await db["follows"].count_documents(
+        {"follower": me_oid, "status": "accepted"}
     )
-    creators_count = len(oid_set(pref.get("followed_creators"))) if pref else 0
 
     # ── Recent activity bullets (deterministic) ──────────────────────────────────
     bullets: list[str] = []

@@ -24,6 +24,7 @@ from app.tools.list_communities import get_my_communities
 from app.tools.list_creators import get_followed_creators
 from app.tools.list_friends import get_my_friends
 from app.tools.social_overview import get_social_overview
+from app.tools.trending_creators import get_trending_creators
 from app.tools.user_search import search_users
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "get_my_communities",
     "get_my_friends",
     "get_social_overview",
+    "get_trending_creators",
     "lookup_conversation_with",
     "lookup_my_community",
     "search_users",

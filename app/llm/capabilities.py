@@ -345,6 +345,23 @@ CAPABILITIES: tuple[Capability, ...] = (
         examples=("suggest creators",),
         suggestions=("creators", "search_reels"),
     ),
+    Capability(
+        name="trending_creators", intent=Intent.TRENDING_CREATORS, category="Recommendations",
+        icon="🔥", label="Trending Creators", command="trending creators",
+        description="The platform's most popular creators right now.",
+        long_description=(
+            "See which creators are gaining the most followers platform-wide "
+            "over the last week — a non-personalized, real-time popularity "
+            "ranking rather than a recommendation based on your own activity."
+        ),
+        returns=("Creator cards", "New followers this week", "Follow button"),
+        tool="get_trending_creators",
+        aliases=("trending creators", "popular creators", "most popular creators",
+                 "top creators", "hot creators"),
+        slash=("trending creators", "popular creators"),
+        examples=("trending creators", "most popular creators"),
+        suggestions=("suggest_creators", "creators"),
+    ),
     # ── Insights ──────────────────────────────────────────────────────────────────
     Capability(
         name="dashboard", intent=Intent.SOCIAL_OVERVIEW, category="Insights",

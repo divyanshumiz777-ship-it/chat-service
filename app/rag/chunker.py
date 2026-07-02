@@ -124,8 +124,8 @@ def _make_chunks(text: str, payload: AclPayload) -> list[RagChunk]:
 
 def normalize_server(doc: dict) -> list[RagChunk]:
     """DiscordServer → public if visibility="public", else private with member ACL."""
-    name = doc.get("name", "").strip()
-    desc = doc.get("description", "").strip()
+    name = (doc.get("name") or "").strip()
+    desc = (doc.get("description") or "").strip()
     text = f"{name}\n{desc}" if desc else name
     if not text:
         return []

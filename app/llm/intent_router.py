@@ -10,6 +10,7 @@ Intents:
   suggest_friends          — recommend NEW people to connect with (MongoDB tool)
   suggest_communities      — recommend NEW communities to join (MongoDB tool)
   suggest_creators         — recommend NEW creators to follow (MongoDB tool)
+  trending_creators        — most popular / fastest-growing creators platform-wide (MongoDB tool)
   list_friends             — list EXISTING friends (MongoDB tool, not recommendations)
   list_communities         — list JOINED communities (MongoDB tool, not recommendations)
   community_lookup         — membership check / specific community search (MongoDB tool)
@@ -38,6 +39,7 @@ class Intent(str, Enum):
     SUGGEST_FRIENDS = "suggest_friends"
     SUGGEST_COMMUNITIES = "suggest_communities"
     SUGGEST_CREATORS = "suggest_creators"
+    TRENDING_CREATORS = "trending_creators"
     LIST_FRIENDS = "list_friends"
     LIST_COMMUNITIES = "list_communities"
     COMMUNITY_LOOKUP = "community_lookup"
@@ -96,6 +98,14 @@ _SUGGEST_CREATORS_RE = re.compile(
     # "who do I follow" is a listing query and routes to LIST_CREATORS instead.
     r"|\bwho (should|can|could) i follow\b"
     r"|\bpeople to follow\b",
+    re.IGNORECASE,
+)
+# Platform-wide, non-personalized ranking — distinct from SUGGEST_CREATORS
+# (personalized to the asker's history) and LIST_CREATORS (who THEY follow).
+_TRENDING_CREATORS_RE = re.compile(
+    r"\b(trending|hot|top|popular)\b.{0,15}\bcreators?\b"
+    r"|\bcreators?\b.{0,15}\b(trending|popular)\b"
+    r"|\bmost\s+popular\s+creators?\b",
     re.IGNORECASE,
 )
 
@@ -464,6 +474,10 @@ def route_intent(message: str) -> Intent:
         return Intent.SUGGEST_COMMUNITIES
     if _SUGGEST_CREATORS_RE.search(text):
         return Intent.SUGGEST_CREATORS
+    # Checked before LIST_CREATORS: "trending creators" must not fall through
+    # to the bare "creators" catch-all in _LIST_CREATORS_RE.
+    if _TRENDING_CREATORS_RE.search(text):
+        return Intent.TRENDING_CREATORS
 
     # Conversation WITH a named person ("my conversation with divyanshu"). Must
     # be checked before insights — the phrase also contains "my conversation".

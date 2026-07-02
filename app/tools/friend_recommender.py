@@ -6,7 +6,7 @@ and interest signals read directly from MongoDB:
   +5 per mutual community     (shared `users.servers`)
   +4 per mutual friend        (shared `users.friends`)
   +3 shared reel interests    (reels both engaged with positively)
-  +3 shared creators          (shared `followed_creators`)
+  +3 shared creators          (overlap in the real Follow graph)
   +2 per shared tag           (shared `preferred_tags`)
   +1 similar activity         (recently active)
 
@@ -76,10 +76,19 @@ async def _suggest_friends_impl(user_id: str, limit: int) -> list[dict]:
     my_blocked = oid_set(me.get("blockedUsers"))
 
     pref = await db["userreelpreferences"].find_one(
-        {"user_id": me_oid}, {"preferred_tags": 1, "followed_creators": 1}
+        {"user_id": me_oid}, {"preferred_tags": 1}
     )
     my_tags = set(pref.get("preferred_tags") or []) if pref else set()
-    my_creators = oid_set(pref.get("followed_creators")) if pref else set()
+
+    # Real follow graph (Follow.ts) — userreelpreferences.followed_creators
+    # was a dead field with no writer anywhere in the codebase.
+    my_creators: set = set()
+    async for doc in db["follows"].find(
+        {"follower": me_oid, "status": "accepted"}, {"followee": 1}
+    ):
+        f = to_oid(doc.get("followee"))
+        if f:
+            my_creators.add(f)
 
     my_reels = (await _positive_reels(db, {"user_id": me_oid})).get(me_oid, set())
 
@@ -106,16 +115,20 @@ async def _suggest_friends_impl(user_id: str, limit: int) -> list[dict]:
             cand.add(u["_id"])
         async for u in db["users"].find({"_id": {"$in": list(my_friends)}}, {"friends": 1}):
             cand |= oid_set(u.get("friends"))
-    pref_or = []
     if my_tags:
-        pref_or.append({"preferred_tags": {"$in": list(my_tags)}})
-    if my_creators:
-        pref_or.append({"followed_creators": {"$in": list(my_creators)}})
-    if pref_or:
-        async for p in db["userreelpreferences"].find({"$or": pref_or}, {"user_id": 1}):
+        async for p in db["userreelpreferences"].find(
+            {"preferred_tags": {"$in": list(my_tags)}}, {"user_id": 1}
+        ):
             o = to_oid(p.get("user_id"))
             if o:
                 cand.add(o)
+    if my_creators:
+        async for doc in db["follows"].find(
+            {"followee": {"$in": list(my_creators)}, "status": "accepted"}, {"follower": 1}
+        ):
+            f = to_oid(doc.get("follower"))
+            if f:
+                cand.add(f)
 
     cand -= excluded
     if not cand:
@@ -133,11 +146,22 @@ async def _suggest_friends_impl(user_id: str, limit: int) -> list[dict]:
     prefs_map: dict = {}
     async for p in db["userreelpreferences"].find(
         {"user_id": {"$in": cand_list}},
-        {"user_id": 1, "preferred_tags": 1, "followed_creators": 1},
+        {"user_id": 1, "preferred_tags": 1},
     ):
         o = to_oid(p.get("user_id"))
         if o:
             prefs_map[o] = p
+
+    cand_creators_map: dict = defaultdict(set)
+    if my_creators:
+        async for doc in db["follows"].find(
+            {"follower": {"$in": cand_list}, "status": "accepted"},
+            {"follower": 1, "followee": 1},
+        ):
+            f = to_oid(doc.get("follower"))
+            c = to_oid(doc.get("followee"))
+            if f and c:
+                cand_creators_map[f].add(c)
 
     cand_reels = await _positive_reels(db, {"user_id": {"$in": cand_list}}) if my_reels else {}
 
@@ -163,7 +187,7 @@ async def _suggest_friends_impl(user_id: str, limit: int) -> list[dict]:
             score += 3 * n
             reasons.append("shared reel interests")
         p = prefs_map.get(cid) or {}
-        n = len(my_creators & oid_set(p.get("followed_creators")))
+        n = len(my_creators & cand_creators_map.get(cid, set()))
         if n:
             score += 3 * n
             reasons.append("follows creators you follow")

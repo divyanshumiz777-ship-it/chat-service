@@ -1,7 +1,8 @@
 """List creators the user follows — MongoDB only, no Qdrant, no LLM.
 
-Returns ACTUAL followed creators from `userreelpreferences.followed_creators`,
-NOT recommendations. Each entry includes the creator's profile and reel count.
+Returns ACTUAL followed creators from the real `follows` collection
+(follower/followee/status — see backend/src/models/Follow.ts), NOT
+recommendations. Each entry includes the creator's profile and reel count.
 """
 
 from __future__ import annotations
@@ -20,8 +21,8 @@ async def get_followed_creators(user_id: str, limit: int = 20) -> list[dict]:
     """Return creators the user follows. Never raises.
 
     Returns []:
-      - user has no followed creators
-      - userreelpreferences doc missing
+      - user has no accepted follows
+      - user not found
       - unexpected error (logged)
     """
     try:
@@ -38,54 +39,68 @@ async def _get_followed_creators_impl(user_id: str, limit: int) -> list[dict]:
 
     db = get_db()
 
-    total_prefs = await db["userreelpreferences"].count_documents({})
-    logger.info("USER=%s MONGO_TOTAL=%d", user_id, total_prefs)
-
-    pref = await db["userreelpreferences"].find_one(
-        {"user_id": me_oid},
-        {"followed_creators": 1},
-    )
-    if not pref:
-        logger.info("USER=%s SKIP_REASON=no_preferences RETURNED=0", user_id)
+    me = await db["users"].find_one({"_id": me_oid}, {"blockedUsers": 1})
+    if not me:
+        logger.info("USER=%s SKIP_REASON=user_not_found", user_id)
         return []
+    my_blocked = oid_set(me.get("blockedUsers"))
 
-    creator_oids = list(oid_set(pref.get("followed_creators")))
+    follow_docs = await db["follows"].find(
+        {"follower": me_oid, "status": "accepted"},
+        {"followee": 1},
+    ).to_list(length=None)
+    creator_oids = [d["followee"] for d in follow_docs if d.get("followee") is not None]
+
     if not creator_oids:
         logger.info("USER=%s SKIP_REASON=no_followed_creators RETURNED=0", user_id)
         return []
 
     logger.info("USER=%s FILTERED=%d followed_creators", user_id, len(creator_oids))
 
-    # Bulk-fetch creator profiles.
+    # Bulk-fetch creator profiles — also pull blockedUsers so a follow that
+    # predates a block (either direction) doesn't leak through. list_friends.py
+    # already does this both-direction check; this tool previously did neither.
     creator_docs = await db["users"].find(
-        {"_id": {"$in": creator_oids[:limit]}},
-        {"name": 1, "profilePic": 1, "about": 1},
-    ).to_list(length=limit)
+        {"_id": {"$in": creator_oids}},
+        {"name": 1, "profilePic": 1, "about": 1, "blockedUsers": 1},
+    ).to_list(length=len(creator_oids))
 
-    profiles_by_oid: dict = {doc["_id"]: doc for doc in creator_docs}
+    profiles_by_oid: dict = {}
+    skipped_blocked = 0
+    for doc in creator_docs:
+        cid = doc["_id"]
+        if cid in my_blocked or me_oid in oid_set(doc.get("blockedUsers")):
+            skipped_blocked += 1
+            logger.debug("USER=%s SKIP_REASON=blocked creator=%s", user_id, cid)
+            continue
+        profiles_by_oid[cid] = doc
+
+    if skipped_blocked:
+        logger.info("USER=%s SKIP_REASON=blocked count=%d", user_id, skipped_blocked)
+
+    eligible_oids = [c for c in creator_oids if c in profiles_by_oid][:limit]
+    if not eligible_oids:
+        logger.info("USER=%s RETURNED=0 SKIP_REASON=all_blocked", user_id)
+        return []
 
     # Reel counts per creator.
     reel_counts: dict = {}
-    if creator_oids:
-        pipeline = [
-            {
-                "$match": {
-                    "creator_id": {"$in": creator_oids[:limit]},
-                    "isDeleted": {"$ne": True},
-                    "isPublic": {"$ne": False},
-                }
-            },
-            {"$group": {"_id": "$creator_id", "count": {"$sum": 1}}},
-        ]
-        async for row in db["reels"].aggregate(pipeline):
-            reel_counts[row["_id"]] = row["count"]
+    pipeline = [
+        {
+            "$match": {
+                "creator_id": {"$in": eligible_oids},
+                "isDeleted": {"$ne": True},
+                "isPublic": {"$ne": False},
+            }
+        },
+        {"$group": {"_id": "$creator_id", "count": {"$sum": 1}}},
+    ]
+    async for row in db["reels"].aggregate(pipeline):
+        reel_counts[row["_id"]] = row["count"]
 
     results: list[dict] = []
-    for coid in creator_oids[:limit]:
-        profile = profiles_by_oid.get(coid)
-        if not profile:
-            logger.debug("USER=%s SKIP_REASON=profile_not_found creator=%s", user_id, coid)
-            continue
+    for coid in eligible_oids:
+        profile = profiles_by_oid[coid]
         results.append({
             "creator_id": str(coid),
             "name": profile.get("name") or "Unknown",
