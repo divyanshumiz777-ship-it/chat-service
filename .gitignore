@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+
+.venv/
+.theSocial-venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+*.log
+_uvicorn.*.log
