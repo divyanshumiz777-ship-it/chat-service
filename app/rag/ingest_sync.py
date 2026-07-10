@@ -1,18 +1,3 @@
-"""Ingestion pipeline — pure async functions. No background jobs, no startup hooks.
-
-Pattern per source:
-  1. bootstrap_collections() + ensure_indexes() (idempotent, cheap on repeat calls)
-  2. Fetch Mongo documents (optionally filtered by `since`)
-  3. Normalize via chunker → RagChunk list
-  4. Deduplicate: skip chunks whose content_hash matches rag_index_state
-  5. Embed only changed/new chunks (embed_batch, Redis-cached)
-  6. Upsert to Qdrant (content_public or content_private based on visibility)
-  7. Update rag_index_state tracking records
-
-Call ingest_all() from a management command, admin endpoint, or backfill script.
-Nothing here runs automatically.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -44,13 +29,13 @@ _EMBED_BATCH = settings.embedding_batch_size
 @dataclass
 class IngestResult:
     source_type: str
-    mongo_total: int = 0   # total documents in collection before any filter
-    docs: int = 0          # Mongo documents fetched (post-filter + limit)
-    chunks: int = 0        # chunks produced by the normalizer (before dedup)
-    embeddings: int = 0    # vectors generated this run
-    points: int = 0        # Qdrant points built
-    upserted: int = 0      # points successfully written to Qdrant + index
-    skipped: int = 0       # content_hash unchanged (dedup)
+    mongo_total: int = 0  
+    docs: int = 0         
+    chunks: int = 0        
+    embeddings: int = 0  
+    points: int = 0        
+    upserted: int = 0      
+    skipped: int = 0       
     errors: int = 0
 
     def log_summary(self) -> None:
@@ -95,9 +80,6 @@ async def _embed_and_upsert(chunks: list[RagChunk], result: IngestResult) -> Non
                              result.source_type, len(batch))
             result.errors += len(batch)
             continue
-
-        # An empty vector means embedding silently produced nothing — drop the
-        # chunk rather than sending a malformed point to Qdrant.
         valid = [(c, v) for c, v in zip(batch, vectors) if v]
         dropped = len(batch) - len(valid)
         if dropped:
@@ -106,7 +88,6 @@ async def _embed_and_upsert(chunks: list[RagChunk], result: IngestResult) -> Non
             result.errors += dropped
         result.embeddings += len(valid)
 
-        # Group by Qdrant collection to minimise round-trips
         by_coll: dict[str, list[tuple[RagChunk, list[float]]]] = {}
         for chunk, vector in valid:
             coll = _qdrant_collection(chunk.payload.visibility)
@@ -117,8 +98,6 @@ async def _embed_and_upsert(chunks: list[RagChunk], result: IngestResult) -> Non
                 {
                     "id": _point_id(c.payload.source_id, c.chunk_index),
                     "vector": v,
-                    # excerpt = the chunk text stored in the payload so the
-                    # context layer has actual content to cite from.
                     "payload": {**c.payload.to_dict(), "excerpt": c.text},
                 }
                 for c, v in items
@@ -284,11 +263,9 @@ async def ingest_reels(
     db = get_db()
     src = "reel"
 
-    # ── Observability: collection baseline ────────────────────────────────────
     result.mongo_total = await db["reels"].count_documents({})
     logger.info("SOURCE=%s MONGO_TOTAL=%d", src, result.mongo_total)
 
-    # Counts to explain what was filtered out (all cheap index-covered counts).
     skip_deleted = await db["reels"].count_documents({"isDeleted": True})
     skip_not_public = await db["reels"].count_documents(
         {"isDeleted": {"$ne": True}, "isPublic": {"$ne": True}}
@@ -298,13 +275,6 @@ async def ingest_reels(
         src, skip_deleted, skip_not_public,
     )
 
-    # ── Filter ────────────────────────────────────────────────────────────────
-    # Safer defaults:
-    #   - isDeleted: {$ne: True}  → includes reels where the field is absent.
-    #     The previous equality check on False silently dropped every reel that
-    #     never had the field set (MongoDB equality on missing path = no match).
-    #   - isPublic: True stays strict — privacy-safe: absent ≠ explicitly public.
-    # Reel uses snake_case timestamps (updated_at, not updatedAt).
     query: dict[str, Any] = {"isDeleted": {"$ne": True}, "isPublic": True}
     if since:
         query["updated_at"] = {"$gt": since}
@@ -343,15 +313,12 @@ async def ingest_users(
     db = get_db()
     src = "user"
 
-    # ── Observability: collection baseline ────────────────────────────────────
     result.mongo_total = await db["users"].count_documents({})
     logger.info("SOURCE=%s MONGO_TOTAL=%d", src, result.mongo_total)
 
-    # Counts to explain filtered-out documents (index-covered counts).
     skip_private = await db["users"].count_documents(
         {"settings.privacy.profileVisibility": {"$in": ["private", "friends"]}}
     )
-    # Users with no setting at all (field absent at any nesting level).
     no_setting = await db["users"].count_documents(
         {"settings.privacy.profileVisibility": {"$exists": False}}
     )
@@ -363,19 +330,6 @@ async def ingest_users(
         "no_visibility_setting=%d explicit_public=%d",
         src, skip_private, no_setting, explicit_public,
     )
-
-    # ── Filter ────────────────────────────────────────────────────────────────
-    # Old query: {"settings.privacy.profileVisibility": "public"}
-    # Problem: MongoDB dot-notation equality on a missing nested path never
-    # matches, so every user without settings / settings.privacy /
-    # profileVisibility was silently dropped (returned 0 docs in sparse DBs).
-    #
-    # Fix: include users who have NOT explicitly opted out ("private"/"friends").
-    # This correctly handles:
-    #   - users who set profileVisibility = "public"     → included
-    #   - users who never set the field                  → included (fallback)
-    #   - users who set profileVisibility = "private"    → excluded
-    #   - users who set profileVisibility = "friends"    → excluded
     query: dict[str, Any] = {
         "settings.privacy.profileVisibility": {"$nin": ["private", "friends"]}
     }
@@ -390,7 +344,6 @@ async def ingest_users(
         logger.info("SOURCE=%s SKIPPED=all reason=no_documents_passed_filter", src)
         return result
 
-    # Break down by how each included user qualified (debug-level; not noisy).
     n_explicit = sum(
         1 for d in docs
         if (d.get("settings") or {}).get("privacy", {}).get("profileVisibility") == "public"
@@ -423,7 +376,6 @@ async def ingest_users(
 async def ingest_messages(
     since: datetime | None = None, limit: int = 1000
 ) -> IngestResult:
-    """Ingest channel messages, DM messages, and group messages in one pass."""
     result = IngestResult(source_type="message")
     await _bootstrap()
     db = get_db()
@@ -435,17 +387,14 @@ async def ingest_messages(
     if not docs:
         return result
 
-    # Partition by message context
     channel_docs = [d for d in docs if d.get("server") and d.get("channel")]
     dm_docs = [d for d in docs if d.get("conversationId") and not d.get("server")]
     group_docs = [d for d in docs if d.get("groupId") and not d.get("server")]
 
-    # Batch-fetch server meta for channel messages
     server_meta = await _fetch_server_meta(
         list({d["server"] for d in channel_docs if d.get("server")})
     )
 
-    # Batch-fetch conversation participants for DM messages
     conv_ids = list({d["conversationId"] for d in dm_docs if d.get("conversationId")})
     conv_meta: dict[str, list[str]] = {}
     if conv_ids:
@@ -455,7 +404,6 @@ async def ingest_messages(
         for c in conv_docs:
             conv_meta[str(c["_id"])] = [str(p) for p in c.get("participants", [])]
 
-    # Batch-fetch group participants for group messages
     group_ids = list({d["groupId"] for d in group_docs if d.get("groupId")})
     group_meta: dict[str, list[str]] = {}
     if group_ids:
@@ -490,7 +438,6 @@ async def ingest_messages(
 async def ingest_notifications(
     since: datetime | None = None, limit: int = 500
 ) -> IngestResult:
-    """Index unread notifications (drives "summarize unread")."""
     result = IngestResult(source_type="notification")
     await _bootstrap()
     db = get_db()
@@ -514,14 +461,6 @@ async def ingest_notifications(
 
 
 async def ingest_all(since: datetime | None = None) -> dict[str, Any]:
-    """Run every source ingestor in sequence.
-
-    Returns the documented shape:
-        {"status": "success", "results": [{"source": ..., "processed": ...}, ...]}
-
-    Per-source failures are logged with a full traceback (never swallowed) and
-    recorded in the results so a partial run is still observable.
-    """
     logger.info("ingest_all started (since=%s)", since)
 
     results: list[dict[str, Any]] = []

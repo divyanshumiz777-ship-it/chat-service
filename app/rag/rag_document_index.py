@@ -1,21 +1,3 @@
-"""Motor model for the rag_index_state collection.
-
-Tracks which content chunks have been upserted into Qdrant and stores their
-content_hash for change detection — unchanged chunks are skipped on re-runs.
-
-Schema (rag_index_state):
-  source_type  str   — server|channel|thread|reel|user|message|notification
-  source_id    str   — MongoDB _id as string
-  chunk_index  int   — 0-based position within a multi-chunk document
-  content_hash str   — SHA-1 of the chunk text
-  vector_id    str   — Qdrant point UUID (deterministic)
-  collection   str   — content_public | content_private
-  status       str   — ok | error
-  embedded_at  date  — timestamp of the last successful upsert
-
-Unique index: (source_type, source_id, chunk_index).
-"""
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -30,7 +12,6 @@ def _coll():
 
 
 async def ensure_indexes() -> None:
-    """Create required indexes (idempotent — safe to call before every ingest run)."""
     coll = _coll()
     await coll.create_index(
         [("source_type", 1), ("source_id", 1), ("chunk_index", 1)],
@@ -43,10 +24,6 @@ async def ensure_indexes() -> None:
 async def get_existing_hashes(
     source_type: str, source_ids: list[str]
 ) -> dict[tuple[str, int], str]:
-    """Return {(source_id, chunk_index): content_hash} for the given source ids.
-
-    Used to skip chunks whose text has not changed since the last ingest run.
-    """
     cursor = _coll().find(
         {"source_type": source_type, "source_id": {"$in": source_ids}},
         {"source_id": 1, "chunk_index": 1, "content_hash": 1, "_id": 0},
@@ -66,7 +43,6 @@ async def upsert_index_entry(
     vector_id: str,
     collection: str,
 ) -> None:
-    """Record a successful Qdrant upsert (or update the hash if content changed)."""
     await _coll().update_one(
         {
             "source_type": source_type,

@@ -1,13 +1,3 @@
-"""Text normalization, chunking, and ACL payload generation for all RAG sources.
-
-Pure module — no I/O. Each normalize_* function accepts a raw Motor document dict
-and returns a list of RagChunk objects ready for embedding. ACL payloads follow the
-Qdrant filter contract: visibility="public" OR X-User-Id ∈ allowed_user_ids.
-
-Sources: DiscordServer, Channel, Thread, Reel, User,
-         Message (channel / DM / group), Notification.
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -17,8 +7,8 @@ from typing import Any
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-_MAX_CHARS = 512    # target chunk ceiling; sentence split may land slightly lower
-_OVERLAP_CHARS = 64  # context overlap between consecutive chunks
+_MAX_CHARS = 512    
+_OVERLAP_CHARS = 64  
 
 
 # ── Data structures ────────────────────────────────────────────────────────────
@@ -27,17 +17,17 @@ _OVERLAP_CHARS = 64  # context overlap between consecutive chunks
 class AclPayload:
     """Qdrant point payload encoding identity + access-control for one chunk."""
 
-    source_type: str   # server|channel|thread|reel|user|message|notification
-    source_id: str     # MongoDB _id as string
-    visibility: str    # "public" | "private"
+    source_type: str  
+    source_id: str   
+    visibility: str    
     server_id: str | None = None
     channel_id: str | None = None
     conversation_id: str | None = None
     group_id: str | None = None
     owner_id: str | None = None
     allowed_user_ids: list[str] = field(default_factory=list)
-    updated_at: str = ""  # ISO 8601
-    title: str = ""      # human-readable label for citations
+    updated_at: str = "" 
+    title: str = ""  
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -58,11 +48,9 @@ class AclPayload:
 
 @dataclass
 class RagChunk:
-    """One embeddable unit of text with its ACL payload and content fingerprint."""
-
     text: str
     payload: AclPayload
-    content_hash: str   # SHA-1 of text — change detector for deduplication
+    content_hash: str
     chunk_index: int = 0
 
 
@@ -123,7 +111,6 @@ def _make_chunks(text: str, payload: AclPayload) -> list[RagChunk]:
 # ── Source normalizers ─────────────────────────────────────────────────────────
 
 def normalize_server(doc: dict) -> list[RagChunk]:
-    """DiscordServer → public if visibility="public", else private with member ACL."""
     name = (doc.get("name") or "").strip()
     desc = (doc.get("description") or "").strip()
     text = f"{name}\n{desc}" if desc else name
@@ -133,7 +120,6 @@ def normalize_server(doc: dict) -> list[RagChunk]:
     is_public = doc.get("visibility") == "public"
     allowed: list[str] = []
     if not is_public:
-        # members is an embedded array of {user: ObjectId, roles, banned, muted}
         allowed = _str_ids([m.get("user") for m in doc.get("members", [])])
 
     payload = AclPayload(

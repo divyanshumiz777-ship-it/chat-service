@@ -1,15 +1,3 @@
-"""Qdrant client + collection bootstrap for the AI Chat Service.
-
-Foundation layer ONLY: a lazy async Qdrant client, idempotent collection
-bootstrap (content_public / content_private), an existence check, a readiness
-status, and clean shutdown. NO vectors, data, search, ACL filters, or retrieval
-are built here.
-
-The `qdrant-client` package is imported lazily inside functions so this module
-imports even when the package is absent — in that case readiness reports
-"not_wired" rather than raising.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -24,10 +12,6 @@ _client: Any | None = None
 
 
 def get_client() -> Any:
-    """Lazily create the shared async Qdrant client.
-
-    Raises ImportError if qdrant-client is not installed.
-    """
     global _client
     if _client is None:
         from qdrant_client import AsyncQdrantClient
@@ -46,16 +30,10 @@ def _distance() -> Any:
 
 
 async def collection_exists(name: str) -> bool:
-    """True if the named collection exists."""
     return bool(await get_client().collection_exists(name))
 
 
 async def bootstrap_collections() -> None:
-    """Create content_public / content_private if absent. Idempotent.
-
-    Creates only the collection schema (vector params) — NO points/vectors are
-    inserted. Safe to call repeatedly (e.g. before ingestion).
-    """
     from qdrant_client.models import VectorParams
 
     client = get_client()
@@ -76,12 +54,6 @@ async def bootstrap_collections() -> None:
 
 
 async def get_qdrant_status() -> str:
-    """Readiness status: 'healthy' | 'unhealthy' | 'not_wired'. Never raises.
-
-    not_wired  — no URL configured, or the qdrant-client package is unavailable.
-    healthy    — reachable.
-    unhealthy  — configured but unreachable / errored.
-    """
     if not settings.qdrant_url:
         return "not_wired"
     try:
@@ -98,11 +70,6 @@ async def get_qdrant_status() -> str:
 
 
 async def upsert_points(collection_name: str, points: list[dict]) -> None:
-    """Upsert points into a Qdrant collection.
-
-    Each point dict: {"id": str (UUID), "vector": list[float], "payload": dict}
-    Raises on Qdrant error — callers are responsible for catching and counting.
-    """
     from qdrant_client.models import PointStruct
 
     client = get_client()

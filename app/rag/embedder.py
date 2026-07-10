@@ -1,15 +1,3 @@
-"""Sentence-embedding engine for the AI Chat Service.
-
-A lazy singleton SentenceTransformer (model name from EMBEDDING_MODEL config)
-with a Redis-backed embedding cache (`chat:embed:{sha1(text)}`, 24h TTL) and
-batch support. The model is loaded ONLY on first embed call — never at import or
-startup — so health checks stay lightweight, and `model.encode` runs off the
-event loop via asyncio.to_thread. sentence-transformers is imported lazily so
-this module imports without the package installed.
-
-NO Qdrant writes, ingestion, retrieval, ACL filters, or Gemini live here.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -29,10 +17,6 @@ _model: Any | None = None
 
 
 def get_model() -> Any:
-    """Lazily load the SentenceTransformer model (singleton), on first use only.
-
-    Raises ImportError if sentence-transformers is unavailable.
-    """
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
@@ -43,7 +27,6 @@ def get_model() -> Any:
 
 
 def reset_model() -> None:
-    """Drop the in-memory model (frees memory; reloads on next use)."""
     global _model
     _model = None
 
@@ -83,7 +66,6 @@ async def _cache_set(key: str, vector: list[float]) -> None:
 
 
 def _encode(texts: list[str]) -> list[list[float]]:
-    """Synchronous model encode (run via asyncio.to_thread by callers)."""
     model = get_model()
     vectors = model.encode(
         texts,
@@ -101,11 +83,6 @@ async def embed_text(text: str) -> list[float]:
 
 
 async def embed_batch(texts: list[str]) -> list[list[float]]:
-    """Embed a batch of strings, reusing one model instance.
-
-    Cache-aware: only uncached texts are encoded (in a single model.encode call),
-    and freshly computed vectors are written back to the cache.
-    """
     if not texts:
         return []
 

@@ -1,12 +1,3 @@
-"""Access-scoped retrieval engine for the AI Chat Service.
-
-Embeds the query, queries Qdrant with mandatory ACL filters, re-ranks results by
-a weighted combination of vector similarity, recency, and popularity, then returns
-deduplicated citations (one per source document, best matching chunk only).
-
-NO text generation. NO Gemini. NO summarization. NO assistant endpoints.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -33,15 +24,9 @@ _OVERRETRIEVE_FACTOR = 3  # fetch 3× top_k from Qdrant, rerank, then slice to t
 
 
 # ── Source-type filtering ───────────────────────────────────────────────────
-# Canonical source_type values actually stored in Qdrant payloads (see chunker).
 _CANONICAL_TYPES = frozenset({
     "server", "channel", "thread", "reel", "user", "message", "notification",
 })
-
-# Maps external/friendly type names (frontend chips or the gateway) to the
-# canonical source_type(s) above. The "Communities" chip, legacy
-# "discordserver"/"group"/"creator" names, and simple plurals all resolve here,
-# so callers never need to know the internal vocabulary.
 _TYPE_ALIASES: dict[str, list[str]] = {
     "discordserver": ["server"],
     "server": ["server"],
@@ -50,11 +35,11 @@ _TYPE_ALIASES: dict[str, list[str]] = {
     "communities": ["server", "channel", "thread"],
     "channel": ["channel"],
     "channels": ["channel"],
-    "group": ["message"],          # group DMs are indexed as messages
+    "group": ["message"],         
     "groups": ["message"],
     "thread": ["thread"],
     "threads": ["thread"],
-    "creator": ["user"],           # creators are users; no dedicated index
+    "creator": ["user"],          
     "creators": ["user"],
     "user": ["user"],
     "users": ["user"],
@@ -68,12 +53,6 @@ _TYPE_ALIASES: dict[str, list[str]] = {
 
 
 def _resolve_source_types(types: list[str] | None) -> set[str]:
-    """Normalize requested type names to canonical source_types.
-
-    None or empty → empty set (no filtering: search every source).
-    Unknown values are dropped with a warning rather than raising, so a stray
-    chip name never breaks search.
-    """
     if not types:
         return set()
     resolved: set[str] = set()
@@ -95,14 +74,13 @@ def _resolve_source_types(types: list[str] | None) -> set[str]:
 
 @dataclass
 class SearchResult:
-    """One retrieval citation — safe to pass to Gemini or return to the gateway."""
 
-    id: str           # Qdrant point UUID
-    source_type: str  # server|channel|thread|reel|user|message|notification
-    source_id: str    # MongoDB _id as string
-    title: str        # human-readable name (from AclPayload.title)
-    score: float      # combined re-rank score (0–1)
-    metadata: dict[str, Any] = field(default_factory=dict)  # payload minus ACL fields
+    id: str           
+    source_type: str 
+    source_id: str  
+    title: str       
+    score: float      
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ── Scoring helpers ────────────────────────────────────────────────────────────
@@ -122,9 +100,6 @@ def _recency_score(updated_at: str) -> float:
 
 
 def _popularity_score(payload: dict) -> float:
-    """Normalized popularity (0–1). Returns 0.5 (neutral) until payload is enriched."""
-    # Popularity signals (likeCount, viewCount, etc.) are not yet stored in the
-    # Qdrant payload — the weight has no effect until a future ingest-side addition.
     return 0.5
 
 
@@ -143,13 +118,6 @@ def _build_acl_filter(
     collection: str,
     source_types: set[str] | None = None,
 ) -> Any:
-    """
-    Build the mandatory Qdrant filter for a collection:
-      content_public  → visibility == "public"
-      content_private → user_id ∈ allowed_user_ids
-    plus an optional source_type restriction so unrelated types are never
-    retrieved (the filter is pushed into Qdrant, not applied post-hoc).
-    """
     from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
     must: list[Any] = []
@@ -176,7 +144,6 @@ async def _query_collection(
     acl_filter: Any,
     limit: int,
 ) -> list[Any]:
-    """Run one Qdrant similarity search. Returns [] on any error (never raises)."""
     try:
         client = get_client()
         return await client.search(
@@ -192,7 +159,6 @@ async def _query_collection(
 
 
 def _to_result(point: Any) -> SearchResult:
-    """Convert a Qdrant ScoredPoint to a SearchResult."""
     payload = point.payload or {}
     title = payload.get("title") or (
         f"{payload.get('source_type', '')} {str(payload.get('source_id', ''))[:8]}"
@@ -200,7 +166,7 @@ def _to_result(point: Any) -> SearchResult:
     score = _rerank_score(float(point.score), payload)
     metadata = {
         k: v for k, v in payload.items()
-        if k != "allowed_user_ids"  # never expose ACL list to callers
+        if k != "allowed_user_ids"  
     }
     return SearchResult(
         id=str(point.id),
@@ -213,7 +179,6 @@ def _to_result(point: Any) -> SearchResult:
 
 
 def _dedup_by_source(results: list[SearchResult]) -> list[SearchResult]:
-    """Keep only the highest-scoring chunk per source document."""
     best: dict[str, SearchResult] = {}
     for r in results:
         if r.source_id not in best or r.score > best[r.source_id].score:
@@ -228,7 +193,6 @@ async def search_public(
     top_k: int = _DEFAULT_TOP_K,
     types: list[str] | None = None,
 ) -> list[SearchResult]:
-    """Search the public collection only. No user context required."""
     source_types = _resolve_source_types(types)
     query_vector = await embed_text(query)
     raw = await _query_collection(
@@ -246,7 +210,6 @@ async def search_private(
     top_k: int = _DEFAULT_TOP_K,
     types: list[str] | None = None,
 ) -> list[SearchResult]:
-    """Search the private collection for content the user is authorised to see."""
     source_types = _resolve_source_types(types)
     query_vector = await embed_text(query)
     raw = await _query_collection(
@@ -264,15 +227,6 @@ async def search_all(
     top_k: int = _DEFAULT_TOP_K,
     types: list[str] | None = None,
 ) -> list[SearchResult]:
-    """Search both collections concurrently, merge, re-rank, and deduplicate.
-
-    Mandatory ACL per collection:
-      content_public  → visibility == "public"
-      content_private → user_id ∈ allowed_user_ids
-
-    `types` optionally restricts the search to specific source types (resolved
-    via _resolve_source_types). None/empty searches all sources.
-    """
     source_types = _resolve_source_types(types)
     query_vector = await embed_text(query)
     per_coll = top_k * _OVERRETRIEVE_FACTOR
