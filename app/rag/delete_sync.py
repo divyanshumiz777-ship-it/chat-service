@@ -1,0 +1,82 @@
+"""Qdrant deletion/tombstone path.
+
+Every ingest_* function in ingest_sync.py upserts content into Qdrant, but
+until this module, nothing ever removed a point once its source document was
+deleted in MongoDB — a deleted server/channel's messages and voice-session
+recaps stayed searchable/recallable through the assistant forever. This
+closes that gap.
+
+Deletes by FIELD FILTER (server_id / channel_id / source_type+source_id),
+not by enumerating individual point ids. Every chunk's AclPayload already
+carries server_id and channel_id (see chunker.py's normalize_* functions),
+and both are self-referential on their own "server"/"channel" chunk too —
+so one filtered delete per collection removes the entity's own chunk AND
+everything nested under it in a single call, without needing to know the
+full list of child message/thread/voice_session ids up front.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from app.config import get_settings
+from app.rag.qdrant_client import delete_by_fields
+from app.rag.rag_document_index import delete_index_entries
+
+settings = get_settings()
+logger = logging.getLogger(f"{settings.service_name}.delete_sync")
+
+
+def _collections() -> tuple[str, str]:
+    return (settings.qdrant_collection_public, settings.qdrant_collection_private)
+
+
+async def delete_by_server(server_id: str) -> None:
+    """Remove every indexed chunk belonging to `server_id` — the server's own
+    chunk plus every channel/thread/message/voice_session nested under it
+    (all carry server_id in their payload). Called when a server is deleted.
+    """
+    for collection in _collections():
+        try:
+            await delete_by_fields(collection, {"server_id": server_id})
+        except Exception:
+            logger.exception(
+                "qdrant delete_by_server failed for server=%s in %s", server_id, collection
+            )
+
+
+async def delete_by_channel(channel_id: str) -> None:
+    """Remove every indexed chunk belonging to `channel_id` — the channel's
+    own chunk plus its messages and voice sessions. Called when a channel is
+    deleted (independent of its parent server, e.g. a channel deleted on its
+    own rather than via a whole-server delete).
+    """
+    for collection in _collections():
+        try:
+            await delete_by_fields(collection, {"channel_id": channel_id})
+        except Exception:
+            logger.exception(
+                "qdrant delete_by_channel failed for channel=%s in %s", channel_id, collection
+            )
+
+
+async def delete_source(source_type: str, source_id: str) -> None:
+    """Remove ONE specific source document's chunk(s) — for a single-entity
+    delete (a thread, a standalone message) rather than a server/channel-wide
+    cascade. Also cleans up its rag_index_state tracking row(s), which the
+    bulk cascades above deliberately skip (see delete_index_entries' own
+    comment for why that's fine there).
+    """
+    for collection in _collections():
+        try:
+            await delete_by_fields(
+                collection, {"source_type": source_type, "source_id": source_id}
+            )
+        except Exception:
+            logger.exception(
+                "qdrant delete_source failed for %s/%s in %s", source_type, source_id, collection
+            )
+    try:
+        await delete_index_entries(source_type, source_id)
+    except Exception:
+        logger.exception("rag_index_state cleanup failed for %s/%s", source_type, source_id)

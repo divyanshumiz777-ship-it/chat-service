@@ -61,6 +61,7 @@ from app.tools import (
     suggest_friends,
 )
 from app.rag.ingest_sync import ingest_all, ingest_voice_session
+from app.rag.delete_sync import delete_by_channel, delete_by_server, delete_source
 
 router = APIRouter(prefix="/internal/v1", tags=["internal"])
 settings = get_settings()
@@ -127,6 +128,40 @@ async def ingest() -> dict:
 async def ping() -> dict:
     """Authenticated reachability check for the gateway."""
     return {"status": "ok", "service": settings.service_name}
+
+
+class DeleteContentRequest(BaseModel):
+    scope: str  # "server" | "channel" | "source"
+    id: str
+    # Required only when scope == "source" — which content-type table the id
+    # belongs to (e.g. "thread", "message"). Ignored for "server"/"channel"
+    # scopes, which match by field rather than by a single source_id.
+    source_type: str | None = None
+
+
+@router.post("/delete", dependencies=[Depends(require_internal_token)])
+async def delete_content(request: DeleteContentRequest) -> dict:
+    """Remove indexed content for a deleted server/channel/single source
+    document — the Qdrant-side half of a Mongo delete. Gateway-only, called
+    right after the corresponding MongoDB delete succeeds (deleteServer /
+    deleteChannel / etc. in the Node backend). Best-effort from the caller's
+    perspective — the Mongo delete has already committed either way; this
+    only controls whether the deleted content keeps surfacing through
+    search/the assistant.
+    """
+    if request.scope == "server":
+        await delete_by_server(request.id)
+    elif request.scope == "channel":
+        await delete_by_channel(request.id)
+    elif request.scope == "source":
+        if not request.source_type:
+            raise HTTPException(
+                status_code=400, detail="source_type is required when scope='source'"
+            )
+        await delete_source(request.source_type, request.id)
+    else:
+        raise HTTPException(status_code=400, detail=f"unknown scope: {request.scope!r}")
+    return {"status": "ok"}
 
 
 @router.get("/capabilities", dependencies=[Depends(require_internal_token)])

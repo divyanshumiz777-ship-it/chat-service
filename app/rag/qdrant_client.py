@@ -81,6 +81,31 @@ async def upsert_points(collection_name: str, points: list[dict]) -> None:
     logger.debug("upserted %d point(s) into %s", len(qdrant_points), collection_name)
 
 
+async def delete_by_fields(collection_name: str, conditions: dict[str, str]) -> None:
+    """Delete every point in `collection_name` whose payload matches ALL of
+    `conditions` (field -> exact value, ANDed).
+
+    Refuses an empty/blank-valued conditions dict rather than silently
+    building a match-everything filter — Qdrant's delete-by-filter has no
+    separate "are you sure" step, so a bug that produced e.g. {"server_id":
+    ""} must fail loudly here instead of wiping the whole collection.
+    """
+    if not conditions or not all(conditions.values()):
+        raise ValueError("delete_by_fields requires non-empty field=value conditions")
+
+    from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
+
+    client = get_client()
+    filter_ = Filter(
+        must=[FieldCondition(key=k, match=MatchValue(value=v)) for k, v in conditions.items()]
+    )
+    await client.delete(
+        collection_name=collection_name,
+        points_selector=FilterSelector(filter=filter_),
+    )
+    logger.debug("deleted points matching %s from %s", conditions, collection_name)
+
+
 async def close_client() -> None:
     """Close the shared client (call on shutdown)."""
     global _client

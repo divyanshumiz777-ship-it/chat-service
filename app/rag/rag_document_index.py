@@ -60,3 +60,15 @@ async def upsert_index_entry(
         },
         upsert=True,
     )
+
+
+async def delete_index_entries(source_type: str, source_id: str) -> None:
+    """Remove tracking rows for one deleted source (all its chunk_index
+    rows). Only meaningful for a single-source delete — a server/channel
+    cascade delete doesn't call this (see rag/delete_sync.py's own comment):
+    the underlying Mongo documents are gone too, so get_existing_hashes()
+    simply never asks about those ids again; the stale rows are harmless,
+    unqueried dead weight rather than a correctness issue, and this
+    collection has no server_id/channel_id field to bulk-match on anyway.
+    """
+    await _coll().delete_many({"source_type": source_type, "source_id": source_id})
