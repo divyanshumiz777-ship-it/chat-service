@@ -10,6 +10,7 @@ These tools read MongoDB directly and never use Qdrant or semantic search:
   - community lookup (membership check / specific community search)
   - social overview (aggregate stats / dashboard)
   - user search (global ACL-safe people search)
+  - voice session recall (most recent summarized call in a channel)
 """
 
 from app.tools.community_lookup import lookup_my_community
@@ -26,6 +27,7 @@ from app.tools.list_friends import get_my_friends
 from app.tools.social_overview import get_social_overview
 from app.tools.trending_creators import get_trending_creators
 from app.tools.user_search import search_users
+from app.tools.voice_session_recall import get_voice_session_recall
 
 __all__ = [
     "build_conversation_summary",
@@ -37,6 +39,7 @@ __all__ = [
     "get_my_friends",
     "get_social_overview",
     "get_trending_creators",
+    "get_voice_session_recall",
     "lookup_conversation_with",
     "lookup_my_community",
     "search_users",

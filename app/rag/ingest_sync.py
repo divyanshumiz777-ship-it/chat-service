@@ -167,6 +167,17 @@ async def _fetch_server_meta(server_oids: list[Any]) -> dict[str, dict]:
     return meta
 
 
+async def _fetch_channel_names(channel_oids: list[Any]) -> dict[str, str]:
+    """Batch-fetch {str(channel_id): name} for the given OIDs (display-title only)."""
+    if not channel_oids:
+        return {}
+    db = get_db()
+    docs = await db["channels"].find(
+        {"_id": {"$in": channel_oids}}, {"name": 1},
+    ).to_list(length=len(channel_oids))
+    return {str(d["_id"]): d.get("name", "") for d in docs}
+
+
 # ── Ingest functions ───────────────────────────────────────────────────────────
 
 async def ingest_servers(
@@ -435,6 +446,76 @@ async def ingest_messages(
     return result
 
 
+async def ingest_voice_session(
+    doc: dict,
+    server_visibility: str,
+    server_member_ids: list[str],
+    channel_name: str = "",
+) -> IngestResult:
+    """Immediate, single-document ingestion for one just-summarized voice
+    session — called right after /internal/v1/voice/summarize generates its
+    summary (app.api.internal), NOT part of ingest_all()'s periodic batch
+    scan, so a fresh summary is searchable the moment it exists rather than
+    waiting for the next scheduled/triggered ingest pass. No content-hash
+    dedup check (unlike every ingest_* below) — a session is summarized
+    exactly once, so there is no "unchanged since last ingest" case to skip.
+    `channel_name` is optional (only affects the chunk's display title) — the
+    gateway already has it on hand from the session's own channel document.
+    """
+    result = IngestResult(source_type="voice_session")
+    await _bootstrap()
+    chunks = chunker.normalize_voice_session(
+        doc, server_visibility, server_member_ids, channel_name
+    )
+    result.docs = 1
+    result.chunks = len(chunks)
+    if chunks:
+        await _embed_and_upsert(chunks, result)
+    return result
+
+
+async def ingest_voice_sessions(
+    since: datetime | None = None, limit: int = 500
+) -> IngestResult:
+    """Periodic/batch re-ingestion path (ingest_all()) — a resilience net in
+    case Qdrant data is ever lost/rebuilt; the primary path for a fresh
+    summary is ingest_voice_session()'s immediate call, above."""
+    result = IngestResult(source_type="voice_session")
+    await _bootstrap()
+    db = get_db()
+
+    query: dict[str, Any] = {"status": "summarized"}
+    if since:
+        query["endedAt"] = {"$gt": since}
+    docs = await db["voicesessions"].find(query).limit(limit).to_list(length=limit)
+    if not docs:
+        return result
+
+    server_meta = await _fetch_server_meta(
+        list({d["server"] for d in docs if d.get("server")})
+    )
+    channel_names = await _fetch_channel_names(
+        list({d["channel"] for d in docs if d.get("channel")})
+    )
+    source_ids = [str(d["_id"]) for d in docs]
+    existing = await get_existing_hashes("voice_session", source_ids)
+
+    raw_chunks: list[RagChunk] = []
+    for doc in docs:
+        meta = server_meta.get(str(doc.get("server", "")), {"visibility": "private", "member_ids": []})
+        ch_name = channel_names.get(str(doc.get("channel", "")), "")
+        raw_chunks.extend(
+            chunker.normalize_voice_session(doc, meta["visibility"], meta["member_ids"], ch_name)
+        )
+
+    result.docs = len(docs)
+    result.chunks = len(raw_chunks)
+    to_embed = _dedup(raw_chunks, existing, result)
+    if to_embed:
+        await _embed_and_upsert(to_embed, result)
+    return result
+
+
 async def ingest_notifications(
     since: datetime | None = None, limit: int = 500
 ) -> IngestResult:
@@ -473,6 +554,7 @@ async def ingest_all(since: datetime | None = None) -> dict[str, Any]:
         ingest_users,
         ingest_messages,
         ingest_notifications,
+        ingest_voice_sessions,
     ):
         try:
             result = await fn(since=since)

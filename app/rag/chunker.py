@@ -319,6 +319,47 @@ def normalize_group_message(doc: dict, participants: list[str]) -> list[RagChunk
     return _make_chunks(text, payload)
 
 
+def normalize_voice_session(
+    doc: dict,
+    server_visibility: str,
+    server_member_ids: list[str],
+    channel_name: str = "",
+) -> list[RagChunk]:
+    """Voice session summary — inherits visibility from its parent server,
+    exactly like a channel message. `doc` is a VoiceSession Mongo document;
+    summary/keyPoints/actionItems live directly on it (see
+    backend/src/models/VoiceSession.ts), not a separate collection, since a
+    session only ever has one summary. Sessions with no summary yet (still
+    active/processing/failed) have nothing to embed and are skipped.
+    `channel_name` is optional (callers may not always have it resolved) and
+    only affects the display title, not the indexed text or ACL."""
+    summary = (doc.get("summary") or "").strip()
+    key_points = doc.get("keyPoints") or []
+    action_items = doc.get("actionItems") or []
+    parts = [summary] if summary else []
+    if key_points:
+        parts.append("Key points: " + "; ".join(key_points))
+    if action_items:
+        parts.append("Action items: " + "; ".join(action_items))
+    text = "\n".join(parts).strip()
+    if not text:
+        return []
+
+    is_public = server_visibility == "public"
+    title = f"Voice call in #{channel_name}" if channel_name else "Voice session"
+    payload = AclPayload(
+        source_type="voice_session",
+        source_id=_str_id(doc.get("_id")),
+        visibility="public" if is_public else "private",
+        server_id=_str_id(doc.get("server")),
+        channel_id=_str_id(doc.get("channel")),
+        allowed_user_ids=[] if is_public else server_member_ids,
+        updated_at=_str_date(doc.get("endedAt")),
+        title=title,
+    )
+    return _make_chunks(text, payload)
+
+
 def normalize_notification(doc: dict) -> list[RagChunk]:
     """Notification — recipient-only (drives "summarize unread")."""
     title = doc.get("title", "").strip()

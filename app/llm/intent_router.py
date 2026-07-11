@@ -23,6 +23,7 @@ Intents:
   summarize_conversation   — summarize the current/open DM or group chat
   community_summary        — summarize a community (server) — metadata + recent activity (MongoDB tool)
   channel_summary          — summarize a channel — messages + pinned + threads (MongoDB tool)
+  voice_session_recall     — recap the last voice/call session in a channel (MongoDB tool)
   mixed                    — platform query fused with general explanation request
   qa                       — default: platform-scoped question answered via RAG
 """
@@ -52,6 +53,7 @@ class Intent(str, Enum):
     SUMMARIZE_CONVERSATION = "summarize_conversation"
     COMMUNITY_SUMMARY = "community_summary"
     CHANNEL_SUMMARY = "channel_summary"
+    VOICE_SESSION_RECALL = "voice_session_recall"
     HELP = "help"
     QA = "qa"
     MIXED = "mixed"
@@ -248,6 +250,22 @@ _SUMMARIZE_CONVERSATION_RE = re.compile(
     rf"|\b{_SUMMARIZE_VERBS}\b.*\b(conversation|chat|dm|discussion)\b"
 )
 
+# Voice-session recall — recap of a PAST voice/call session, distinct from
+# CHANNEL_SUMMARY's present-tense "what happens in X channel" (ongoing text
+# activity). Requires recall framing (past tense "what happened"/"what was
+# discussed", or recap/summarize) PLUS an explicit call/voice/meeting/session
+# marker, so a plain "summarize #general" still routes to CHANNEL_SUMMARY.
+# Checked BEFORE CHANNEL_SUMMARY — "recap the voice session" would otherwise
+# match CHANNEL_SUMMARY's looser "recap ... channel" pattern once a channel
+# name is mentioned nearby.
+_VOICE_SESSION_RECALL_RE = re.compile(
+    r"\bwhat\s+(?:happened|was\s+(?:discussed|said|talked\s+about)|did\s+we\s+(?:talk|discuss)\s+about)\b"
+    r".{0,40}\b(?:call|voice(?:\s+(?:call|chat|session))?|meeting|session)\b"
+    r"|\b(?:recap|summar[iy]ze?)\b.{0,30}\b(?:call|voice\s+(?:call|chat|session)|meeting|voice\s+session)\b"
+    r"|\b(?:call|voice\s+(?:call|chat)|meeting|voice\s+session)\b.{0,20}\b(?:recap|summary)\b",
+    re.IGNORECASE,
+)
+
 # ── Community / channel summary (MongoDB tools — never RAG) ────────────────────
 # Checked before the platform gate because many channel names (#notes, #general)
 # carry no _PLATFORM_WORDS token and would otherwise fall through to CHAT.
@@ -294,8 +312,16 @@ _EXTRACT_CHANNEL_WORD_RE = re.compile(
     r"\bthe\s+([\w-]{2,40})\s+channel\b"
     r"|\b(?:summarize?|recap)\s+(?:the\s+)?([\w-]{2,40})\s+channel\b"
     r"|\bin\s+(?:the\s+)?([\w-]{2,40})\s+channel\b"
-    r"|\bwhat\s+(?:happens?|is\s+discussed)\s+in\s+(?:the\s+)?([\w-]{2,40})\b"
-    r"|\bwho\s+should\s+(?:join|use)\s+(?:the\s+)?([\w-]{2,40})\b",
+    # "what happens/happened/is discussed/was discussed/was said/was talked
+    # about in [the] <name>" — the "happened"/"was …" forms feed
+    # VOICE_SESSION_RECALL's past-tense phrasing (extract_channel_name is
+    # reused for both intents; a channel name is a channel name either way).
+    r"|\bwhat\s+(?:happens?|happened|is\s+discussed|was\s+discussed|was\s+said|was\s+talked\s+about)\s+in\s+(?:the\s+)?([\w-]{2,40})\b"
+    r"|\bwho\s+should\s+(?:join|use)\s+(?:the\s+)?([\w-]{2,40})\b"
+    # Trailing "in [the] <name>" with nothing after it (e.g. "recap the voice
+    # session in general") — a last-resort fallback, so it's listed last;
+    # only reached when none of the more specific forms above matched.
+    r"|\bin\s+(?:the\s+)?([\w-]{2,40})\s*[?.!]*\s*$",
     re.IGNORECASE,
 )
 
@@ -333,11 +359,12 @@ _MIXED_RE = re.compile(
 
 
 def extract_channel_name(message: str) -> str | None:
-    """Extract the channel name from a channel-summary message.
+    """Extract the channel name from a channel-summary or voice-recall message.
 
     Tries `#channelname` notation first (strongest signal), then falls back to
-    "the <name> channel" / "in <name> channel" word patterns.  Returns the
-    lowercased channel name, or None when no specific name is found.
+    "the <name> channel" / "in <name> channel" / "what happened in <name>"
+    word patterns.  Returns the lowercased channel name, or None when no
+    specific name is found.
     """
     if not message:
         return None
@@ -520,6 +547,14 @@ def route_intent(message: str) -> Intent:
     # platform keyword) and routed to the dedicated Mongo summarizer, not RAG.
     if _SUMMARIZE_CONVERSATION_RE.search(text):
         return Intent.SUMMARIZE_CONVERSATION
+
+    # Voice-session recall — checked BEFORE CHANNEL_SUMMARY: "recap the voice
+    # session" or "what happened in the design call" would otherwise match
+    # CHANNEL_SUMMARY's looser "recap/what happens ... channel" patterns.
+    # Requires explicit call/voice/meeting/session framing (see the regex's
+    # own comment), so a plain "summarize #general" is unaffected.
+    if _VOICE_SESSION_RECALL_RE.search(text):
+        return Intent.VOICE_SESSION_RECALL
 
     # Community / channel summary — checked BEFORE the platform gate because
     # channel names (#notes, #general) often carry no _PLATFORM_WORDS token and

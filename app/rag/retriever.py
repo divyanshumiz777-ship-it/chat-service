@@ -26,6 +26,7 @@ _OVERRETRIEVE_FACTOR = 3  # fetch 3× top_k from Qdrant, rerank, then slice to t
 # ── Source-type filtering ───────────────────────────────────────────────────
 _CANONICAL_TYPES = frozenset({
     "server", "channel", "thread", "reel", "user", "message", "notification",
+    "voice_session",
 })
 _TYPE_ALIASES: dict[str, list[str]] = {
     "discordserver": ["server"],
@@ -35,11 +36,11 @@ _TYPE_ALIASES: dict[str, list[str]] = {
     "communities": ["server", "channel", "thread"],
     "channel": ["channel"],
     "channels": ["channel"],
-    "group": ["message"],         
+    "group": ["message"],
     "groups": ["message"],
     "thread": ["thread"],
     "threads": ["thread"],
-    "creator": ["user"],          
+    "creator": ["user"],
     "creators": ["user"],
     "user": ["user"],
     "users": ["user"],
@@ -49,6 +50,11 @@ _TYPE_ALIASES: dict[str, list[str]] = {
     "messages": ["message"],
     "notification": ["notification"],
     "notifications": ["notification"],
+    "voice_session": ["voice_session"],
+    "voice_sessions": ["voice_session"],
+    "voice": ["voice_session"],
+    "call": ["voice_session"],
+    "calls": ["voice_session"],
 }
 
 

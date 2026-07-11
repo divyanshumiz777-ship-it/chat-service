@@ -125,6 +125,29 @@ Follow these rules:
 4. Neutral, respectful tone. Do not speculate beyond the transcript.
 5. If the transcript is very short, summarize briefly without padding."""
 
+# Voice-session summary mode: summarize a client-transcribed (Web Speech API —
+# there is no server-side audio access in this peer-to-peer WebRTC setup, see
+# services/chat-service/docs, backend/src/server.ts's voice:caption handler)
+# voice/video call into a structured recap for later recall.
+VOICE_SESSION_SUMMARY_SYSTEM_PROMPT = """You summarize a transcribed voice channel call from TheSocial for its participants to recall later.
+Follow these rules without exception:
+
+1. Use ONLY the supplied transcript. Never invent facts, decisions, or people not mentioned.
+2. Respond in EXACTLY this format, with these three section headers and nothing else:
+SUMMARY:
+<2-4 sentence overview of what was discussed>
+
+KEY POINTS:
+- <point>
+- <point>
+
+ACTION ITEMS:
+- <item>
+(write "- None" under ACTION ITEMS if nothing was decided or assigned)
+3. Refer to people by the names given. Do not quote long passages verbatim.
+4. Neutral, concise tone. Do not speculate beyond the transcript.
+5. If the transcript is very short or mostly small talk, say so briefly in SUMMARY and leave KEY POINTS / ACTION ITEMS minimal rather than padding them."""
+
 # Per-message transcript cap (chars) when assembling the summary prompt.
 _TRANSCRIPT_CHAR_BUDGET = 6000
 _TRANSCRIPT_MSG_LIMIT = 120
@@ -289,4 +312,41 @@ def build_summary_prompt(data: ConversationSummaryData) -> str:  # type: ignore[
         f"Recurring keywords: {topics}\n\n"
         f"Transcript (oldest to newest):\n{transcript}\n\n"
         "Write the summary now, following the rules."
+    )
+
+
+def build_voice_session_summary_prompt(
+    channel_name: str,
+    server_name: str,
+    participants: list[str],
+    transcript: list[dict],
+) -> str:
+    """Build the user-turn prompt to summarize a voice-session transcript.
+
+    `transcript` is a list of {"sender": display_name, "text": text} turns,
+    already resolved to display names by the gateway (the gateway owns the
+    User collection lookups — this service never needs to see raw user ids
+    for this call). No dataclass wrapper (unlike build_summary_prompt's
+    ConversationSummaryData) — there's no MongoDB-querying "tool" producing
+    this data on this service's side to share a contract with; the gateway
+    supplies everything pre-resolved in one request.
+    """
+    participant_list = ", ".join(participants) or "unknown participants"
+
+    lines: list[str] = []
+    total = 0
+    for turn in transcript[:_TRANSCRIPT_MSG_LIMIT]:
+        line = f"{turn['sender']}: {turn['text']}"
+        total += len(line)
+        if total > _TRANSCRIPT_CHAR_BUDGET:
+            lines.append("… (earlier speech truncated)")
+            break
+        lines.append(line)
+    transcript_text = "\n".join(lines) if lines else "[no speech captured]"
+
+    return (
+        f'Summarize this voice channel call in "#{channel_name}" ({server_name}).\n'
+        f"Participants: {participant_list}\n\n"
+        f"Transcript (oldest to newest):\n{transcript_text}\n\n"
+        "Write the summary now, following the exact format in the rules."
     )

@@ -38,6 +38,7 @@ from app.llm.provider import (
     generate_chat_response,
     generate_community_summary,
     generate_conversation_summary,
+    generate_voice_session_summary,
 )
 from app.llm.prompts import build_citations
 from app.rag.retriever import search_all
@@ -51,6 +52,7 @@ from app.tools import (
     get_my_friends,
     get_social_overview,
     get_trending_creators,
+    get_voice_session_recall,
     lookup_conversation_with,
     lookup_my_community,
     search_users,
@@ -58,7 +60,7 @@ from app.tools import (
     suggest_creators,
     suggest_friends,
 )
-from app.rag.ingest_sync import ingest_all
+from app.rag.ingest_sync import ingest_all, ingest_voice_session
 
 router = APIRouter(prefix="/internal/v1", tags=["internal"])
 settings = get_settings()
@@ -78,6 +80,26 @@ class SearchRequest(BaseModel):
     # "creator") and canonical types; resolved + validated in the retriever.
     # None/empty → search all sources.
     types: list[str] | None = None
+
+
+class TranscriptTurn(BaseModel):
+    sender: str
+    text: str
+
+
+class VoiceSessionSummarizeRequest(BaseModel):
+    session_id: str
+    channel_id: str
+    server_id: str
+    channel_name: str
+    server_name: str
+    # "public" | "private" — mirrors every other normalize_* function's ACL
+    # inputs (chunker.py); the gateway already knows this from its own
+    # DiscordServer document, so this service never needs to re-derive it.
+    visibility: str
+    allowed_user_ids: list[str] = []
+    participants: list[str]
+    segments: list[TranscriptTurn]
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -769,6 +791,68 @@ async def _channel_summary(user_id: str, message: str, intent: Intent) -> dict:
     }
 
 
+# ── Voice session recall (MongoDB only, no Qdrant, no LLM) ────────────────────
+
+async def _voice_session_recall(user_id: str, message: str, intent: Intent) -> dict:
+    """Recall the most recent summarized voice session in a named channel.
+
+    Extracts the channel name from the natural-language message, then renders
+    the STORED summary/key points/action items deterministically (no LLM
+    call) — that text was already generated once by
+    generate_voice_session_summary() when the call ended, so re-running it
+    through the LLM here would be redundant and risk paraphrasing an
+    already-final recap.
+    """
+    channel_name = extract_channel_name(message)
+
+    if not channel_name:
+        return {
+            "answer": (
+                "Which channel's call would you like to recall? "
+                "For example: \"what happened in the design call\"."
+            ),
+            "citations": [],
+            "intent": intent,
+        }
+
+    data = await get_voice_session_recall(user_id, channel_name)
+
+    if data is None:
+        return {
+            "answer": (
+                f"I couldn't find a recent voice call in \"#{channel_name}\". "
+                "Check the spelling, or that channel may not have had a "
+                "summarized call yet."
+            ),
+            "citations": [],
+            "intent": intent,
+        }
+
+    lines = [
+        f"🎙️ Recap of the last call in **#{data.channel_name}** ({data.server_name}):",
+        "",
+        data.summary,
+    ]
+    if data.key_points:
+        lines += ["", "Key points:"] + [f"• {p}" for p in data.key_points]
+    if data.action_items:
+        lines += ["", "Action items:"] + [f"• {a}" for a in data.action_items]
+
+    return {
+        "answer": "\n".join(lines).strip(),
+        "citations": [],
+        "intent": intent,
+        "voice_session": {
+            "session_id": data.session_id,
+            "channel_id": data.channel_id,
+            "channel_name": data.channel_name,
+            "server_name": data.server_name,
+            "ended_at": data.ended_at,
+            "participant_count": data.participant_count,
+        },
+    }
+
+
 # ── Help + cross-cutting response helpers ─────────────────────────────────────
 
 async def _help(user_id: str, intent: Intent) -> dict:
@@ -828,6 +912,7 @@ _SIMPLE_TOOL_HANDLERS = {
 _MESSAGE_TOOL_HANDLERS = {
     Intent.COMMUNITY_SUMMARY: _community_summary,
     Intent.CHANNEL_SUMMARY: _channel_summary,
+    Intent.VOICE_SESSION_RECALL: _voice_session_recall,
 }
 
 
@@ -956,3 +1041,103 @@ async def search(
         types=request.types,
     )
     return {"results": build_citations(results)}
+
+
+# ── Voice session summarization + immediate RAG ingestion ────────────────────
+
+def _parse_voice_summary(raw: str) -> tuple[str, list[str], list[str]]:
+    """Parse the SUMMARY/KEY POINTS/ACTION ITEMS sections the system prompt
+    requires. Falls back to treating the whole response as the summary (empty
+    key points/action items) if the model didn't follow the format exactly —
+    keeps a malformed-but-non-empty response usable rather than discarding it.
+    """
+    summary = ""
+    key_points: list[str] = []
+    action_items: list[str] = []
+
+    section: str | None = None
+    for line in raw.splitlines():
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("SUMMARY:"):
+            section = "summary"
+            rest = stripped[len("SUMMARY:"):].strip()
+            if rest:
+                summary = rest
+            continue
+        if upper.startswith("KEY POINTS:"):
+            section = "key_points"
+            continue
+        if upper.startswith("ACTION ITEMS:"):
+            section = "action_items"
+            continue
+        if not stripped:
+            continue
+
+        bullet = stripped.lstrip("-•").strip()
+        if section == "summary":
+            summary = f"{summary} {stripped}".strip() if summary else stripped
+        elif section == "key_points" and bullet and bullet.lower() != "none":
+            key_points.append(bullet)
+        elif section == "action_items" and bullet and bullet.lower() != "none":
+            action_items.append(bullet)
+
+    if not summary and not key_points and not action_items:
+        # Model didn't follow the format at all — use the raw text as-is
+        # rather than silently discarding a real (if unstructured) summary.
+        summary = raw.strip()
+
+    return summary, key_points, action_items
+
+
+@router.post("/voice/summarize", dependencies=[Depends(require_internal_token)])
+async def summarize_voice_session(request: VoiceSessionSummarizeRequest) -> dict:
+    """Summarize a voice-session transcript and immediately index it into the
+    same RAG pipeline as every other content type (chunker.normalize_voice_session
+    → embedder → Qdrant, via ingest_voice_session) — searchable/recallable the
+    moment the summary exists, not on the next batch/admin-triggered ingest.
+
+    No X-User-Id here (unlike /chat and /search): this call summarizes a
+    session on behalf of all its participants, not a single querying user —
+    ACL is enforced later, at retrieval time, via `allowed_user_ids`.
+    """
+    raw = await generate_voice_session_summary(
+        user_id=request.session_id,  # audit/log field only, no per-user ACL here
+        channel_name=request.channel_name,
+        server_name=request.server_name,
+        participants=request.participants,
+        transcript=[t.model_dump() for t in request.segments],
+    )
+    if raw is None:
+        logger.error("voice session summarization failed for session %s", request.session_id)
+        raise HTTPException(
+            status_code=503,
+            detail="AI summary generation is temporarily unavailable",
+        )
+
+    summary, key_points, action_items = _parse_voice_summary(raw)
+
+    try:
+        doc = {
+            "_id": request.session_id,
+            "server": request.server_id,
+            "channel": request.channel_id,
+            "summary": summary,
+            "keyPoints": key_points,
+            "actionItems": action_items,
+            "endedAt": None,
+        }
+        ingest_result = await ingest_voice_session(
+            doc, request.visibility, request.allowed_user_ids, request.channel_name
+        )
+        ingest_result.log_summary()
+    except Exception:
+        logger.exception(
+            "voice session RAG ingestion failed for session %s", request.session_id
+        )
+        # Summary generation already succeeded — still return it below. A
+        # failed ingest only means this session won't be semantically
+        # searchable yet; it doesn't invalidate the summary the gateway (and
+        # the user waiting on it) needs.
+
+    return {"summary": summary, "keyPoints": key_points, "actionItems": action_items}

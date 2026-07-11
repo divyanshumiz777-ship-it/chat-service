@@ -175,6 +175,36 @@ CAPABILITIES: tuple[Capability, ...] = (
         examples=("summarize #general", "what happens in #notes", "tell me about #social-zone"),
         suggestions=("communities", "community_summary"),
     ),
+    Capability(
+        name="voice_recall", intent=Intent.VOICE_SESSION_RECALL, category="Social",
+        icon="🎙️", label="Voice Recall", command="what happened in the design call",
+        description=(
+            "Recap the most recent voice call in a channel — summary, key points, action items."
+        ),
+        long_description=(
+            "Ask what happened in a voice channel's last call. Returns the AI-generated "
+            "summary, key points, and action items from the most recently completed "
+            "session — the same recap posted to the channel when the call ended. "
+            "Mention the channel name for best results."
+        ),
+        returns=("Session summary", "Key points", "Action items", "When it happened"),
+        tool="get_voice_session_recall",
+        aliases=(
+            "what happened in the call",
+            "what happened in the meeting",
+            "recap the call",
+            "recap the meeting",
+            "what was discussed in the call",
+            "voice session recap",
+        ),
+        slash=("voice recall",),
+        examples=(
+            "what happened in the design call",
+            "recap the voice session in general",
+            "what was discussed in the standup meeting",
+        ),
+        suggestions=("channel_summary", "communities"),
+    ),
     # ── Messages ──────────────────────────────────────────────────────────────────
     Capability(
         name="conversations", intent=Intent.CONVERSATION_INSIGHTS, category="Messages",

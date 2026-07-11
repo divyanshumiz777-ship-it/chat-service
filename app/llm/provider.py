@@ -22,10 +22,12 @@ from app.llm.prompts import (
     NO_DATA_FALLBACK,
     SUMMARY_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    VOICE_SESSION_SUMMARY_SYSTEM_PROMPT,
     build_channel_summary_prompt,
     build_community_summary_prompt,
     build_prompt,
     build_summary_prompt,
+    build_voice_session_summary_prompt,
 )
 
 if TYPE_CHECKING:
@@ -207,6 +209,55 @@ async def generate_channel_summary(
     except Exception as exc:  # noqa: BLE001
         logger.error("generate_channel_summary failed for user %s: %s", user_id, exc)
         return _GENERIC_ERROR
+
+
+async def generate_voice_session_summary(
+    user_id: str,
+    channel_name: str,
+    server_name: str,
+    participants: list[str],
+    transcript: list[dict],
+) -> str | None:
+    """Generate a structured (SUMMARY/KEY POINTS/ACTION ITEMS) voice-session
+    recap. Never raises — but unlike every other generate_* function in this
+    module, returns None on any failure instead of a safe fallback STRING.
+    The other functions' callers only ever display the returned text as a
+    transient chat reply, where showing "AI assistant is not available" is
+    an acceptable (if unfortunate) message. This function's caller
+    (app.api.internal's /voice/summarize) persists the result to MongoDB AND
+    semantically indexes it into Qdrant — silently saving/embedding a
+    degraded placeholder string as if it were a real meeting summary would
+    corrupt both the record and future search/recall results, so the caller
+    needs to be able to tell "failed" apart from "here is real text" and
+    surface a genuine retry instead.
+    """
+    prompt = build_voice_session_summary_prompt(
+        channel_name=channel_name,
+        server_name=server_name,
+        participants=participants,
+        transcript=transcript,
+    )
+
+    try:
+        if settings.llm_provider != "groq":
+            logger.error("unknown llm_provider configured: %s", settings.llm_provider)
+            return None
+
+        from app.llm import groq_client
+
+        answer = await groq_client.complete(
+            system_prompt=VOICE_SESSION_SUMMARY_SYSTEM_PROMPT, user_prompt=prompt
+        )
+        return answer.strip() or None
+    except RuntimeError as exc:
+        logger.error("llm provider not configured: %s", exc)
+        return None
+    except ImportError:
+        logger.error("llm provider SDK is not installed")
+        return None
+    except Exception as exc:  # noqa: BLE001 — graceful degradation boundary
+        logger.error("generate_voice_session_summary failed for user %s: %s", user_id, exc)
+        return None
 
 
 # NOTE: recommendations are NOT formatted by the LLM. They are rendered
