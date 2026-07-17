@@ -97,3 +97,23 @@ async def complete(system_prompt: str, user_prompt: str) -> str:
     if last_error is not None:
         raise last_error
     raise RuntimeError("no Groq model produced a response")
+
+
+# ── Audio transcription ────────────────────────────────────────────────────────
+
+async def transcribe(audio_bytes: bytes, filename: str, language: str = "en") -> str:
+    """Transcribe a short audio clip via Groq's Whisper endpoint.
+
+    A distinct Groq API surface from chat completions (`audio.transcriptions`,
+    not `chat.completions`) — no model-fallback chain here, just the one
+    configured Whisper model. Raises on failure; the caller (the internal
+    voice/transcribe-chunk route) maps that to a clean HTTP error rather than
+    ever surfacing a raw exception.
+    """
+    client = get_client()
+    response = await client.audio.transcriptions.create(
+        model=settings.groq_whisper_model,
+        file=(filename, audio_bytes),
+        language=language,
+    )
+    return (response.text or "").strip()

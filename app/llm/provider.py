@@ -260,6 +260,34 @@ async def generate_voice_session_summary(
         return None
 
 
+async def transcribe_audio_chunk(
+    audio_bytes: bytes, filename: str, language: str = "en"
+) -> str | None:
+    """Transcribe one short live-caption audio chunk. Never raises — returns
+    None on any failure (same reasoning as generate_voice_session_summary:
+    the caller either relays real text or drops the chunk entirely, never a
+    fabricated placeholder string as if someone actually said it).
+    """
+    try:
+        if settings.llm_provider != "groq":
+            logger.error("unknown llm_provider configured: %s", settings.llm_provider)
+            return None
+
+        from app.llm import groq_client
+
+        text = await groq_client.transcribe(audio_bytes, filename, language=language)
+        return text or None
+    except RuntimeError as exc:
+        logger.error("llm provider not configured: %s", exc)
+        return None
+    except ImportError:
+        logger.error("llm provider SDK is not installed")
+        return None
+    except Exception as exc:  # noqa: BLE001 — graceful degradation boundary
+        logger.error("transcribe_audio_chunk failed: %s", exc)
+        return None
+
+
 # NOTE: recommendations are NOT formatted by the LLM. They are rendered
 # deterministically in app/api/internal._format_recommendations() so that
 # chain-of-thought / invented entries can never leak. There is intentionally no

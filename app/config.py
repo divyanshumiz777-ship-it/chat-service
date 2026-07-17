@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     groq_max_output_tokens: int = 2048   # cap to contain cost + latency
     groq_timeout_seconds: float = 30.0   # per-request budget (prioritise responsiveness)
     groq_max_retries: int = 1            # transient-error retries per model (SDK-level)
+    # Groq's Whisper transcription (audio.transcriptions.create) — a distinct
+    # API surface from chat completions above, so it gets its own model
+    # setting rather than reusing groq_model/groq_model_chain (those are
+    # fallback-chained chat models, not applicable here).
+    groq_whisper_model: str = "whisper-large-v3-turbo"
 
     @property
     def groq_model_chain(self) -> list[str]:

@@ -11,7 +11,9 @@ are never read or trusted.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import mimetypes
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
@@ -39,6 +41,7 @@ from app.llm.provider import (
     generate_community_summary,
     generate_conversation_summary,
     generate_voice_session_summary,
+    transcribe_audio_chunk,
 )
 from app.llm.prompts import build_citations
 from app.rag.retriever import search_all
@@ -101,6 +104,15 @@ class VoiceSessionSummarizeRequest(BaseModel):
     allowed_user_ids: list[str] = []
     participants: list[str]
     segments: list[TranscriptTurn]
+
+
+class TranscribeChunkRequest(BaseModel):
+    # Base64 JSON rather than multipart — chunks are small (a few seconds of
+    # opus-encoded audio), and this reuses the gateway's existing JSON-only
+    # internal-service transport (see backend/src/lib/aiServiceClient.ts)
+    # instead of adding a second, multipart-capable one just for this.
+    audio_base64: str
+    mime_type: str = "audio/webm"
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -1176,3 +1188,32 @@ async def summarize_voice_session(request: VoiceSessionSummarizeRequest) -> dict
         # the user waiting on it) needs.
 
     return {"summary": summary, "keyPoints": key_points, "actionItems": action_items}
+
+
+@router.post("/voice/transcribe-chunk", dependencies=[Depends(require_internal_token)])
+async def transcribe_voice_chunk(request: TranscribeChunkRequest) -> dict:
+    """Transcribe one short live-caption audio chunk via Groq's Whisper
+    endpoint. Stateless and identity-agnostic on purpose: the gateway
+    (server.ts's voice:audio-chunk handler) already knows who's speaking and
+    which session/channel this belongs to from the JWT-verified socket
+    connection — this endpoint is purely "audio bytes in, text out," so no
+    X-User-Id or session state is needed here.
+    """
+    try:
+        audio_bytes = base64.b64decode(request.audio_base64, validate=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail="audio_base64 is not valid base64"
+        ) from exc
+
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="empty audio payload")
+
+    ext = mimetypes.guess_extension(request.mime_type) or ".webm"
+    text = await transcribe_audio_chunk(audio_bytes, filename=f"chunk{ext}", language="en")
+    if text is None:
+        raise HTTPException(
+            status_code=503, detail="Transcription is temporarily unavailable"
+        )
+
+    return {"text": text}
