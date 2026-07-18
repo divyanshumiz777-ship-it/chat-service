@@ -101,19 +101,76 @@ async def complete(system_prompt: str, user_prompt: str) -> str:
 
 # ── Audio transcription ────────────────────────────────────────────────────────
 
-async def transcribe(audio_bytes: bytes, filename: str, language: str = "en") -> str:
-    """Transcribe a short audio clip via Groq's Whisper endpoint.
+# Whisper's decoder falls back on these boilerplate video-sign-off phrases
+# (learned from its training data, which is heavy on YouTube/subtitle
+# content) when fed silence or near-silence — and it does so CONFIDENTLY:
+# direct testing with pure digital silence produced "Thank you." with
+# no_speech_prob=0 and a perfectly normal avg_logprob, so the usual
+# confidence-based heuristics for detecting hallucination do NOT catch this
+# case. Filtering by exact match against known filler phrases is the
+# pragmatic mitigation most production Whisper-wrapper tools use for exactly
+# this reason — there's no clean confidence signal to threshold on instead.
+_SILENCE_HALLUCINATIONS = frozenset({
+    "thank you",
+    "thanks for watching",
+    "thank you for watching",
+    "thanks for watching!",
+    "thank you for watching!",
+    "bye",
+    "bye-bye",
+    "bye bye",
+    "see you next time",
+    "see you in the next video",
+    "you",
+    "",
+})
+
+
+def _looks_like_silence_hallucination(text: str) -> bool:
+    return text.strip().lower().rstrip(".!?") in _SILENCE_HALLUCINATIONS
+
+
+# Whisper's `prompt` field primes the decoder's initial context — giving it
+# a Hinglish-style example (Hindi words spelled in Roman script) nudges it to
+# CONTINUE transliterating that way rather than switching to Devanagari or
+# translating outright, on top of `language="en"` below (a documented
+# community trick: forcing the English-token decoder while it's actually
+# hearing Hindi phonemes produces a phonetic Roman-script approximation of
+# the speech instead of a literal English rendering or native-script output).
+HINGLISH_PRIMING_PROMPT = (
+    "Yaar, aaj ka din bohot accha tha, sab kuch theek chal raha hai."
+)
+
+
+async def transcribe(
+    audio_bytes: bytes,
+    filename: str,
+    language: str = "en",
+    prompt: str | None = None,
+) -> str:
+    """Transcribe a short audio clip via Groq's Whisper endpoint. Returns an
+    EMPTY STRING — never None — for both "no speech at all" and "this looks
+    like a known silence hallucination": both are legitimate, SUCCESSFUL
+    outcomes (a 4-second window with nobody talking is completely normal and
+    will happen constantly), not errors. Raises on a genuine failure
+    (network/API error) so the caller can tell "processed fine, nothing to
+    say" apart from "the call itself failed" — conflating the two would make
+    ordinary silence between sentences look identical to the transcription
+    service being down.
 
     A distinct Groq API surface from chat completions (`audio.transcriptions`,
     not `chat.completions`) — no model-fallback chain here, just the one
-    configured Whisper model. Raises on failure; the caller (the internal
-    voice/transcribe-chunk route) maps that to a clean HTTP error rather than
-    ever surfacing a raw exception.
+    configured Whisper model.
     """
     client = get_client()
     response = await client.audio.transcriptions.create(
         model=settings.groq_whisper_model,
         file=(filename, audio_bytes),
         language=language,
+        prompt=prompt,
+        response_format="verbose_json",
     )
-    return (response.text or "").strip()
+    text = (response.text or "").strip()
+    if not text or _looks_like_silence_hallucination(text):
+        return ""
+    return text

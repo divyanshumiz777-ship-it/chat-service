@@ -43,6 +43,7 @@ from app.llm.provider import (
     generate_voice_session_summary,
     transcribe_audio_chunk,
 )
+from app.llm import groq_client
 from app.llm.prompts import build_citations
 from app.rag.retriever import search_all
 from app.tools.conversation_summary import build_conversation_summary
@@ -1210,10 +1211,18 @@ async def transcribe_voice_chunk(request: TranscribeChunkRequest) -> dict:
         raise HTTPException(status_code=400, detail="empty audio payload")
 
     ext = mimetypes.guess_extension(request.mime_type) or ".webm"
-    text = await transcribe_audio_chunk(audio_bytes, filename=f"chunk{ext}", language="en")
+    text = await transcribe_audio_chunk(
+        audio_bytes,
+        filename=f"chunk{ext}",
+        language="en",
+        prompt=groq_client.HINGLISH_PRIMING_PROMPT,
+    )
     if text is None:
         raise HTTPException(
             status_code=503, detail="Transcription is temporarily unavailable"
         )
 
+    # text may legitimately be "" (silence, or a filtered hallucination) —
+    # that's a successful 200, not an error; the gateway's ack already
+    # treats an empty string as "nothing to relay," not a failure.
     return {"text": text}

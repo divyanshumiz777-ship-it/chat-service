@@ -66,8 +66,13 @@ class Settings(BaseSettings):
     # Groq's Whisper transcription (audio.transcriptions.create) — a distinct
     # API surface from chat completions above, so it gets its own model
     # setting rather than reusing groq_model/groq_model_chain (those are
-    # fallback-chained chat models, not applicable here).
-    groq_whisper_model: str = "whisper-large-v3-turbo"
+    # fallback-chained chat models, not applicable here). The full model
+    # (not "-turbo", the distilled/pruned variant) — code-switched speech
+    # (e.g. Hindi transliterated to Roman script, "Hinglish") is exactly the
+    # kind of harder edge case a distilled model tends to lose accuracy on
+    # first; Groq's inference is fast enough regardless that the full
+    # model's extra latency is still fine for ~4s live-caption chunks.
+    groq_whisper_model: str = "whisper-large-v3"
 
     @property
     def groq_model_chain(self) -> list[str]:

@@ -261,12 +261,21 @@ async def generate_voice_session_summary(
 
 
 async def transcribe_audio_chunk(
-    audio_bytes: bytes, filename: str, language: str = "en"
+    audio_bytes: bytes,
+    filename: str,
+    language: str = "en",
+    prompt: str | None = None,
 ) -> str | None:
-    """Transcribe one short live-caption audio chunk. Never raises — returns
-    None on any failure (same reasoning as generate_voice_session_summary:
-    the caller either relays real text or drops the chunk entirely, never a
-    fabricated placeholder string as if someone actually said it).
+    """Transcribe one short live-caption audio chunk. Never raises.
+
+    Returns None ONLY on a genuine failure (misconfiguration, network/API
+    error) — the HTTP layer maps that to a 503. Returns an empty string for
+    a chunk that was processed successfully but had nothing worth
+    transcribing (silence, or a filtered silence-hallucination like
+    Whisper's infamous "Thank you." on dead air) — that's a normal, frequent,
+    SUCCESSFUL outcome, not an error, and must stay distinguishable from a
+    real failure or ordinary silence between sentences would look identical
+    to the transcription service being down.
     """
     try:
         if settings.llm_provider != "groq":
@@ -275,8 +284,7 @@ async def transcribe_audio_chunk(
 
         from app.llm import groq_client
 
-        text = await groq_client.transcribe(audio_bytes, filename, language=language)
-        return text or None
+        return await groq_client.transcribe(audio_bytes, filename, language=language, prompt=prompt)
     except RuntimeError as exc:
         logger.error("llm provider not configured: %s", exc)
         return None
