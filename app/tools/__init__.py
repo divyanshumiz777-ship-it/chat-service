@@ -13,6 +13,7 @@ These tools read MongoDB directly and never use Qdrant or semantic search:
   - voice session recall (most recent summarized call in a channel)
 """
 
+from app.tools.catch_me_up import get_catch_me_up_data
 from app.tools.community_lookup import lookup_my_community
 from app.tools.community_recommender import suggest_communities
 from app.tools.community_summary import get_channel_summary, get_community_summary
@@ -31,6 +32,7 @@ from app.tools.voice_session_recall import get_voice_session_recall
 
 __all__ = [
     "build_conversation_summary",
+    "get_catch_me_up_data",
     "get_channel_summary",
     "get_community_summary",
     "get_conversation_insights",

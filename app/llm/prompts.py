@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.rag.retriever import SearchResult
+    from app.tools.catch_me_up import CatchMeUpData
     from app.tools.community_summary import ChannelSummaryData, CommunitySummaryData
     from app.tools.conversation_summary import ConversationSummaryData
 
@@ -147,6 +148,36 @@ ACTION ITEMS:
 3. Refer to people by the names given. Do not quote long passages verbatim.
 4. Neutral, concise tone. Do not speculate beyond the transcript.
 5. If the transcript is very short or mostly small talk, say so briefly in SUMMARY and leave KEY POINTS / ACTION ITEMS minimal rather than padding them."""
+
+# Moderation triage: a fire-and-forget pass over a filed UserReport that only
+# ever PRIORITIZES the human admin's review queue — never auto-bans, never
+# blocks the report from being filed. A human still makes every final call
+# (see backend/src/controllers/adminController.ts's resolveReport).
+MODERATION_TRIAGE_SYSTEM_PROMPT = """You triage a user report filed on TheSocial, a community platform, to help a human moderator prioritize their review queue.
+Follow these rules without exception:
+
+1. Use ONLY the report's stated reason, details, and the reported content snippet (if provided). Never invent context that wasn't given.
+2. Respond in EXACTLY this format, with these three headers and nothing else:
+SEVERITY: <low|medium|high>
+ACTION: <none|warn|mute|ban|escalate>
+RATIONALE: <one concise sentence explaining the severity/action choice>
+3. "high" severity is for content suggesting real, immediate harm (threats, doxxing, csam, targeted harassment campaigns) — reserve it, don't inflate ordinary rudeness or spam to "high".
+4. "escalate" action means this needs urgent human attention beyond a routine mute/ban — use sparingly.
+5. If the report lacks enough detail to judge (empty details, vague reason, no snippet), say so honestly in RATIONALE and default to SEVERITY: low, ACTION: none rather than guessing."""
+
+# Catch-me-up mode: summarize what happened across a returning user's servers
+# since they were last online.
+CATCH_ME_UP_SYSTEM_PROMPT = """You write a short "while you were away" digest for a TheSocial user who just came back online.
+Follow these rules without exception:
+
+1. Use ONLY the supplied per-server activity, DM highlights, and reel highlights. Never invent messages, people, servers, conversations, reels, or facts.
+2. Write 2-4 short sentences per server that had activity — lead with anything that directly mentions the user, then the general gist of what else happened.
+3. If a server had zero activity, omit it entirely — do not mention quiet servers.
+4. Prioritize servers with more mentions or messages first; the data is already ordered that way, so preserve that order.
+5. If DM highlights are supplied, add a short section mentioning who messaged the user and roughly what about — omit this section entirely if no DM highlights are supplied.
+6. If reel highlights are supplied, add a short section mentioning which followed creators posted — omit this section entirely if no reel highlights are supplied.
+7. Friendly, brisk tone — this is a quick catch-up, not a formal report. No preamble like "Here is your digest"; start directly with the content.
+8. If there is truly nothing to report across servers, DMs, and reels combined, say so in one sentence."""
 
 # Per-message transcript cap (chars) when assembling the summary prompt.
 _TRANSCRIPT_CHAR_BUDGET = 6000
@@ -313,6 +344,66 @@ def build_summary_prompt(data: ConversationSummaryData) -> str:  # type: ignore[
         f"Transcript (oldest to newest):\n{transcript}\n\n"
         "Write the summary now, following the rules."
     )
+
+
+def build_moderation_triage_prompt(
+    reason: str,
+    details: str | None,
+    content_type: str | None,
+    snippet: str | None,
+) -> str:
+    """Build the user-turn prompt to triage one filed UserReport."""
+    lines = [f"Reason: {reason}"]
+    if content_type:
+        lines.append(f"Content type: {content_type}")
+    lines.append(f"Reporter's details: {details.strip() if details else '[none provided]'}")
+    lines.append(f"Reported content snippet: {snippet.strip() if snippet else '[none provided]'}")
+    return "\n".join(lines) + "\n\nTriage this report now, following the exact format in the rules."
+
+
+def build_catch_me_up_prompt(data: CatchMeUpData) -> str:  # type: ignore[name-defined]
+    """Build the user-turn prompt for the "while you were away" digest."""
+    if not data.servers and not data.dm_highlights and not data.reel_highlights:
+        return (
+            f"Since: {data.since}\n"
+            "No activity across the user's servers, DMs, or followed creators' reels since then.\n\n"
+            "Write the digest now, following the rules (rule 8 applies)."
+        )
+
+    lines: list[str] = [f"Since: {data.since}", f"Total new messages across all servers: {data.total_message_count}"]
+    if data.total_mention_count:
+        lines.append(f"Total times the user was mentioned: {data.total_mention_count}")
+    lines.append("")
+
+    for s in data.servers:
+        lines.append(f"Server: {s.server_name} ({s.message_count} new messages, {s.mention_count} mentions)")
+        if s.top_channel:
+            lines.append(f"  Most active channel: #{s.top_channel}")
+        if s.mentions:
+            lines.append("  Messages mentioning the user:")
+            for m in s.mentions:
+                lines.append(f"    [{m['channel_name']}] {m['sender']}: {m['text'][:150]}{'…' if len(m['text']) > 150 else ''}")
+        if s.highlights:
+            lines.append("  Recent messages:")
+            for h in s.highlights:
+                lines.append(f"    [{h['channel_name']}] {h['sender']}: {h['text'][:120]}{'…' if len(h['text']) > 120 else ''}")
+        lines.append("")
+
+    if data.dm_highlights:
+        lines.append("Recent direct messages:")
+        for h in data.dm_highlights:
+            lines.append(f"    {h['sender']}: {h['text'][:150]}{'…' if len(h['text']) > 150 else ''}")
+        lines.append("")
+
+    if data.reel_highlights:
+        lines.append("New reels from creators the user follows:")
+        for h in data.reel_highlights:
+            caption = h["caption"][:100] + ("…" if len(h["caption"]) > 100 else "")
+            lines.append(f"    {h['creator_name']}: {caption if caption.strip() else '(no caption)'}")
+        lines.append("")
+
+    lines.append("Write the digest now, following the rules.")
+    return "\n".join(lines)
 
 
 def build_voice_session_summary_prompt(

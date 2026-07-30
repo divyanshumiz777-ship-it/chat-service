@@ -14,9 +14,10 @@ import asyncio
 import base64
 import logging
 import mimetypes
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.core.security import require_internal_token
@@ -36,10 +37,13 @@ from app.llm.capabilities import (
 )
 from app.llm.provider import (
     generate_answer,
+    generate_catch_me_up_digest,
     generate_channel_summary,
     generate_chat_response,
     generate_community_summary,
     generate_conversation_summary,
+    generate_moderation_triage,
+    generate_reel_captions,
     generate_voice_session_summary,
     transcribe_audio_chunk,
 )
@@ -48,6 +52,7 @@ from app.llm.prompts import build_citations
 from app.rag.retriever import search_all
 from app.tools.conversation_summary import build_conversation_summary
 from app.tools import (
+    get_catch_me_up_data,
     get_channel_summary,
     get_community_summary,
     get_conversation_insights,
@@ -65,7 +70,13 @@ from app.tools import (
     suggest_friends,
 )
 from app.rag.ingest_sync import ingest_all, ingest_voice_session
-from app.rag.delete_sync import delete_by_channel, delete_by_server, delete_source
+from app.rag.delete_sync import (
+    delete_by_channel,
+    delete_by_conversation,
+    delete_by_group,
+    delete_by_server,
+    delete_source,
+)
 
 router = APIRouter(prefix="/internal/v1", tags=["internal"])
 settings = get_settings()
@@ -85,6 +96,8 @@ class SearchRequest(BaseModel):
     # "creator") and canonical types; resolved + validated in the retriever.
     # None/empty → search all sources.
     types: list[str] | None = None
+    limit: int = Field(default=10, ge=1, le=50)
+    offset: int = Field(default=0, ge=0)
 
 
 class TranscriptTurn(BaseModel):
@@ -105,6 +118,21 @@ class VoiceSessionSummarizeRequest(BaseModel):
     allowed_user_ids: list[str] = []
     participants: list[str]
     segments: list[TranscriptTurn]
+
+
+class ModerationTriageRequest(BaseModel):
+    reason: str
+    details: str | None = None
+    content_type: str | None = None
+    snippet: str | None = None
+
+
+class CatchMeUpRequest(BaseModel):
+    since: datetime
+
+
+class ReelCaptionsRequest(BaseModel):
+    video_url: str
 
 
 class TranscribeChunkRequest(BaseModel):
@@ -144,7 +172,7 @@ async def ping() -> dict:
 
 
 class DeleteContentRequest(BaseModel):
-    scope: str  # "server" | "channel" | "source"
+    scope: str  # "server" | "channel" | "source" | "conversation" | "group"
     id: str
     # Required only when scope == "source" — which content-type table the id
     # belongs to (e.g. "thread", "message"). Ignored for "server"/"channel"
@@ -166,6 +194,10 @@ async def delete_content(request: DeleteContentRequest) -> dict:
         await delete_by_server(request.id)
     elif request.scope == "channel":
         await delete_by_channel(request.id)
+    elif request.scope == "conversation":
+        await delete_by_conversation(request.id)
+    elif request.scope == "group":
+        await delete_by_group(request.id)
     elif request.scope == "source":
         if not request.source_type:
             raise HTTPException(
@@ -1079,16 +1111,21 @@ async def search(
         )
 
     logger.info(
-        "search user=%s query_len=%d types=%s",
-        x_user_id, len(query), request.types,
+        "search user=%s query_len=%d types=%s limit=%d offset=%d",
+        x_user_id, len(query), request.types, request.limit, request.offset,
     )
 
     results = await search_all(
         user_id=x_user_id,
         query=query,
         types=request.types,
+        top_k=request.limit,
+        offset=request.offset,
     )
-    return {"results": build_citations(results)}
+    # has_more is a heuristic, not an exact count: a full page suggests (but
+    # doesn't guarantee) another page exists — an exact total would require a
+    # second, more expensive query. Good enough to gate a "Load more" button.
+    return {"results": build_citations(results), "has_more": len(results) == request.limit}
 
 
 # ── Voice session summarization + immediate RAG ingestion ────────────────────
@@ -1189,6 +1226,103 @@ async def summarize_voice_session(request: VoiceSessionSummarizeRequest) -> dict
         # the user waiting on it) needs.
 
     return {"summary": summary, "keyPoints": key_points, "actionItems": action_items}
+
+
+@router.post("/moderation/triage", dependencies=[Depends(require_internal_token)])
+async def triage_report(request: ModerationTriageRequest) -> dict:
+    """Triage a filed UserReport for the admin queue — severity + suggested
+    action only, never an auto-ban. Called fire-and-forget right after a
+    report is created (see backend/src/controllers/reportController.ts); a
+    503 here just means the report stays untriaged (visible with no
+    severity badge), it never blocks the report itself from existing.
+    """
+    result = await generate_moderation_triage(
+        reason=request.reason,
+        details=request.details,
+        content_type=request.content_type,
+        snippet=request.snippet,
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Moderation triage is temporarily unavailable",
+        )
+    return result
+
+
+@router.post("/digest/catch-me-up", dependencies=[Depends(require_internal_token)])
+async def catch_me_up(
+    request: CatchMeUpRequest,
+    x_user_id: str = Header(alias="X-User-Id"),
+) -> dict:
+    """"While you were away" digest across every server the caller belongs to.
+
+    Scoped exclusively to the gateway-verified caller (X-User-Id) — there is
+    no way to request another user's digest through this endpoint. A 503
+    here means the gateway falls back to a deterministic non-LLM summary
+    (see backend/src/controllers/digestController.ts) rather than failing
+    the whole request.
+    """
+    data = await get_catch_me_up_data(x_user_id, request.since)
+    if data is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Catch-me-up digest is temporarily unavailable",
+        )
+
+    digest = await generate_catch_me_up_digest(user_id=x_user_id, data=data)
+    return {
+        "digest": digest,
+        "since": data.since,
+        "totalMessageCount": data.total_message_count,
+        "totalMentionCount": data.total_mention_count,
+        "servers": [
+            {
+                "serverId": s.server_id,
+                "serverName": s.server_name,
+                "messageCount": s.message_count,
+                "mentionCount": s.mention_count,
+                "topChannel": s.top_channel,
+            }
+            for s in data.servers
+        ],
+        "dmHighlights": [
+            {
+                "text": h["text"],
+                "sender": h["sender"],
+                "conversationId": h["conversation_id"],
+                "ts": h["ts"],
+            }
+            for h in data.dm_highlights
+        ],
+        "reelHighlights": [
+            {
+                "reelId": h["reel_id"],
+                "creatorName": h["creator_name"],
+                "caption": h["caption"],
+                "ts": h["ts"],
+            }
+            for h in data.reel_highlights
+        ],
+    }
+
+
+@router.post("/reels/generate-captions", dependencies=[Depends(require_internal_token)])
+async def reel_captions(request: ReelCaptionsRequest) -> dict:
+    """Generate a WebVTT caption track for a just-uploaded reel's video.
+
+    Fire-and-forget from backend/src/controllers/reelController.ts right
+    after a reel is created — a 503 here just means the reel stays without
+    captions (the frontend's <track> element simply has nothing to load),
+    it never blocks or retries reel creation itself.
+    """
+    vtt = await generate_reel_captions(request.video_url)
+    if vtt is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Caption generation is unavailable for this reel",
+        )
+    return {"vtt": vtt}
 
 
 @router.post("/voice/transcribe-chunk", dependencies=[Depends(require_internal_token)])

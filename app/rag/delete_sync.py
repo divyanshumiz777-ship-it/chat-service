@@ -60,6 +60,38 @@ async def delete_by_channel(channel_id: str) -> None:
             )
 
 
+async def delete_by_conversation(conversation_id: str) -> None:
+    """Remove every indexed chunk belonging to a DM conversation_id — its
+    messages (see chunker.py's normalize_dm_message, which stamps this field).
+    Called when a whole DM conversation is deleted (e.g. once every
+    participant has left), so its content doesn't linger in Qdrant even
+    though delete_source above already handles a single message delete.
+    """
+    for collection in _collections():
+        try:
+            await delete_by_fields(collection, {"conversation_id": conversation_id})
+        except Exception:
+            logger.exception(
+                "qdrant delete_by_conversation failed for conversation=%s in %s",
+                conversation_id,
+                collection,
+            )
+
+
+async def delete_by_group(group_id: str) -> None:
+    """Remove every indexed chunk belonging to a group-DM group_id — its
+    messages (see chunker.py's normalize_group_message, which stamps this
+    field). Called when a whole group DM is deleted.
+    """
+    for collection in _collections():
+        try:
+            await delete_by_fields(collection, {"group_id": group_id})
+        except Exception:
+            logger.exception(
+                "qdrant delete_by_group failed for group=%s in %s", group_id, collection
+            )
+
+
 async def delete_source(source_type: str, source_id: str) -> None:
     """Remove ONE specific source document's chunk(s) — for a single-entity
     delete (a thread, a standalone message) rather than a server/channel-wide

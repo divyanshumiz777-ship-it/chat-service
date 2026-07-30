@@ -174,3 +174,38 @@ async def transcribe(
     if not text or _looks_like_silence_hallucination(text):
         return ""
     return text
+
+
+async def transcribe_with_segments(
+    audio_bytes: bytes,
+    filename: str,
+    language: str = "en",
+) -> list[dict]:
+    """Transcribe a longer audio/video clip and return per-segment timing.
+
+    Unlike transcribe() above (which discards timing and is used for short
+    live-caption chunks that are each rendered as a single line), this keeps
+    Whisper's own segment boundaries — needed to build a WebVTT track with
+    correctly timed cues for reel captions (see provider.generate_reel_captions).
+    Raises on failure; the caller decides how to degrade.
+    """
+    client = get_client()
+    response = await client.audio.transcriptions.create(
+        model=settings.groq_whisper_model,
+        file=(filename, audio_bytes),
+        language=language,
+        response_format="verbose_json",
+    )
+    segments = getattr(response, "segments", None) or []
+    out: list[dict] = []
+    for seg in segments:
+        # SDK returns either attribute-style objects or plain dicts depending
+        # on version — support both rather than assuming one shape.
+        start = seg.get("start") if isinstance(seg, dict) else getattr(seg, "start", None)
+        end = seg.get("end") if isinstance(seg, dict) else getattr(seg, "end", None)
+        text = seg.get("text") if isinstance(seg, dict) else getattr(seg, "text", None)
+        text = (text or "").strip()
+        if start is None or end is None or not text:
+            continue
+        out.append({"start": float(start), "end": float(end), "text": text})
+    return out

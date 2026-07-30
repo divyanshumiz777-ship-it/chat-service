@@ -16,15 +16,19 @@ from typing import TYPE_CHECKING
 
 from app.config import get_settings
 from app.llm.prompts import (
+    CATCH_ME_UP_SYSTEM_PROMPT,
     CHANNEL_SUMMARY_SYSTEM_PROMPT,
     CHAT_SYSTEM_PROMPT,
     COMMUNITY_SUMMARY_SYSTEM_PROMPT,
+    MODERATION_TRIAGE_SYSTEM_PROMPT,
     NO_DATA_FALLBACK,
     SUMMARY_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     VOICE_SESSION_SUMMARY_SYSTEM_PROMPT,
+    build_catch_me_up_prompt,
     build_channel_summary_prompt,
     build_community_summary_prompt,
+    build_moderation_triage_prompt,
     build_prompt,
     build_summary_prompt,
     build_voice_session_summary_prompt,
@@ -32,6 +36,7 @@ from app.llm.prompts import (
 
 if TYPE_CHECKING:
     from app.rag.retriever import SearchResult
+    from app.tools.catch_me_up import CatchMeUpData
     from app.tools.community_summary import ChannelSummaryData, CommunitySummaryData
     from app.tools.conversation_summary import ConversationSummaryData
 
@@ -211,6 +216,96 @@ async def generate_channel_summary(
         return _GENERIC_ERROR
 
 
+async def generate_catch_me_up_digest(
+    user_id: str,
+    data: CatchMeUpData,  # type: ignore[name-defined]
+) -> str:
+    """Generate a prose "while you were away" digest from MongoDB activity data.
+
+    Never raises. Skips the LLM entirely when there's nothing to report at
+    all (data.servers is empty) — a deterministic message is more reliable
+    than round-tripping to the model for a fact it can't get wrong.
+    """
+    if not data.servers:
+        return "You're all caught up — no new activity since you were last online."
+
+    prompt = build_catch_me_up_prompt(data)
+    try:
+        if settings.llm_provider == "groq":
+            from app.llm import groq_client
+
+            answer = await groq_client.complete(
+                system_prompt=CATCH_ME_UP_SYSTEM_PROMPT, user_prompt=prompt
+            )
+            return answer or _EMPTY
+
+        logger.error("unknown llm_provider configured: %s", settings.llm_provider)
+        return _UNAVAILABLE
+    except RuntimeError as exc:
+        logger.error("llm provider not configured: %s", exc)
+        return _UNAVAILABLE
+    except ImportError:
+        logger.error("llm provider SDK is not installed")
+        return _UNAVAILABLE
+    except Exception as exc:  # noqa: BLE001
+        logger.error("generate_catch_me_up_digest failed for user %s: %s", user_id, exc)
+        return _GENERIC_ERROR
+
+
+def _parse_moderation_triage(raw: str) -> dict | None:
+    """Parse the SEVERITY/ACTION/RATIONALE format. Returns None if the model
+    didn't follow the format at all — the caller treats that as "triage
+    unavailable" rather than guessing at a severity."""
+    severity = None
+    action = None
+    rationale_parts: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("SEVERITY:"):
+            severity = stripped.split(":", 1)[1].strip().lower()
+        elif stripped.upper().startswith("ACTION:"):
+            action = stripped.split(":", 1)[1].strip().lower()
+        elif stripped.upper().startswith("RATIONALE:"):
+            rationale_parts.append(stripped.split(":", 1)[1].strip())
+        elif rationale_parts:
+            rationale_parts.append(stripped)
+
+    if severity not in ("low", "medium", "high"):
+        return None
+    if action not in ("none", "warn", "mute", "ban", "escalate"):
+        action = "none"
+    rationale = " ".join(p for p in rationale_parts if p).strip() or "No rationale provided."
+    return {"severity": severity, "suggestedAction": action, "rationale": rationale[:300]}
+
+
+async def generate_moderation_triage(
+    reason: str,
+    details: str | None,
+    content_type: str | None,
+    snippet: str | None,
+) -> dict | None:
+    """Triage a filed UserReport for the admin queue. Returns None (never
+    raises) on any failure — triage is a nice-to-have prioritization signal,
+    never a gate on the report itself existing or being reviewable."""
+    prompt = build_moderation_triage_prompt(reason, details, content_type, snippet)
+    try:
+        if settings.llm_provider == "groq":
+            from app.llm import groq_client
+
+            raw = await groq_client.complete(
+                system_prompt=MODERATION_TRIAGE_SYSTEM_PROMPT, user_prompt=prompt
+            )
+            if not raw:
+                return None
+            return _parse_moderation_triage(raw)
+
+        logger.error("unknown llm_provider configured: %s", settings.llm_provider)
+        return None
+    except Exception as exc:  # noqa: BLE001 — graceful degradation boundary
+        logger.error("generate_moderation_triage failed: %s", exc)
+        return None
+
+
 async def generate_voice_session_summary(
     user_id: str,
     channel_name: str,
@@ -294,6 +389,92 @@ async def transcribe_audio_chunk(
     except Exception as exc:  # noqa: BLE001 — graceful degradation boundary
         logger.error("transcribe_audio_chunk failed: %s", exc)
         return None
+
+
+# Groq's Whisper endpoint (like OpenAI's, which it mirrors) caps upload size
+# at 25MB — reels are allowed up to 100MB client-side (see
+# frontend/components/ReelUploadModal.tsx), so a real fraction of uploads
+# will legitimately exceed what transcription can accept. That's treated as
+# "captions unavailable" for this reel, not a retryable error.
+_MAX_TRANSCRIBE_BYTES = 25 * 1024 * 1024
+_VIDEO_DOWNLOAD_TIMEOUT_S = 30.0
+
+
+def _vtt_timestamp(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0.0
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+
+
+def _build_webvtt(segments: list[dict]) -> str:
+    """Format Whisper segments as a WebVTT track. Pure formatting, no I/O."""
+    lines = ["WEBVTT", ""]
+    for seg in segments:
+        lines.append(f"{_vtt_timestamp(seg['start'])} --> {_vtt_timestamp(seg['end'])}")
+        lines.append(seg["text"])
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+async def generate_reel_captions(video_url: str) -> str | None:
+    """Download a reel's video and transcribe it into a WebVTT caption track.
+
+    Never raises. Returns None when captions genuinely can't be produced
+    (download failure, file too large for Whisper, no speech detected, LLM
+    provider down) — the caller (internal.py) treats that as "unavailable,"
+    never as a reason to fail reel creation, which has already completed by
+    the time this runs (fire-and-forget from reelController.ts).
+
+    Whisper accepts common video containers (mp4, webm, mov) directly and
+    extracts the audio itself server-side — no local ffmpeg/audio-extraction
+    step is needed here.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=_VIDEO_DOWNLOAD_TIMEOUT_S) as client:
+            resp = await client.get(video_url)
+            resp.raise_for_status()
+            video_bytes = resp.content
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("generate_reel_captions: failed to download %s: %s", video_url, exc)
+        return None
+
+    if not video_bytes:
+        return None
+    if len(video_bytes) > _MAX_TRANSCRIBE_BYTES:
+        logger.info(
+            "generate_reel_captions: %s is %d bytes, over the %d Whisper cap — skipping",
+            video_url, len(video_bytes), _MAX_TRANSCRIBE_BYTES,
+        )
+        return None
+
+    filename = video_url.rsplit("/", 1)[-1] or "reel.mp4"
+
+    try:
+        if settings.llm_provider != "groq":
+            logger.error("unknown llm_provider configured: %s", settings.llm_provider)
+            return None
+
+        from app.llm import groq_client
+
+        segments = await groq_client.transcribe_with_segments(video_bytes, filename)
+    except RuntimeError as exc:
+        logger.error("llm provider not configured: %s", exc)
+        return None
+    except ImportError:
+        logger.error("llm provider SDK is not installed")
+        return None
+    except Exception as exc:  # noqa: BLE001 — graceful degradation boundary
+        logger.error("generate_reel_captions transcription failed for %s: %s", video_url, exc)
+        return None
+
+    if not segments:
+        return None
+    return _build_webvtt(segments)
 
 
 # NOTE: recommendations are NOT formatted by the LLM. They are rendered

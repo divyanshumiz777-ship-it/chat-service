@@ -21,6 +21,9 @@ _W_POPULARITY = 0.10
 
 _DEFAULT_TOP_K = 10
 _OVERRETRIEVE_FACTOR = 3  # fetch 3× top_k from Qdrant, rerank, then slice to top_k
+# Hard cap on offset+top_k passed to Qdrant — bounds the per-collection fetch
+# cost of a "Load more" pagination chain regardless of how deep a caller pages.
+_MAX_EFFECTIVE_K = 100
 
 
 # ── Source-type filtering ───────────────────────────────────────────────────
@@ -232,10 +235,21 @@ async def search_all(
     query: str,
     top_k: int = _DEFAULT_TOP_K,
     types: list[str] | None = None,
+    offset: int = 0,
 ) -> list[SearchResult]:
+    """`offset` paginates the FINAL deduped+reranked list, not Qdrant's own
+    native result ordering — Qdrant's search() call is pre-rerank, so pushing
+    offset down to it would paginate the wrong ordering (and risks skipping
+    or duplicating items once merged/deduped/reranked here). Instead this
+    over-fetches `offset + top_k` (still scaled by _OVERRETRIEVE_FACTOR) from
+    each collection, reranks/dedupes the full set as usual, then slices the
+    requested page out of that final list. _MAX_EFFECTIVE_K bounds how deep
+    a pagination chain can push the underlying Qdrant fetch.
+    """
     source_types = _resolve_source_types(types)
     query_vector = await embed_text(query)
-    per_coll = top_k * _OVERRETRIEVE_FACTOR
+    effective_k = min(offset + top_k, _MAX_EFFECTIVE_K)
+    per_coll = effective_k * _OVERRETRIEVE_FACTOR
 
     pub_raw, priv_raw = await asyncio.gather(
         _query_collection(
@@ -253,4 +267,5 @@ async def search_all(
     )
 
     merged = [_to_result(p) for p in pub_raw + priv_raw]
-    return _dedup_by_source(merged)[:top_k]
+    deduped = _dedup_by_source(merged)
+    return deduped[offset:offset + top_k]
