@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     # Shared infrastructure (clients live in app/core; wired into readiness).
     mongo_uri: str = ""
-    redis_url: str = "redis://redis:6379"
+    redis_url: str = "redis://red-d7v2vglb910c73akocvg:6379"
 
     # MongoDB pooling / server selection.
     mongo_db: str = ""
