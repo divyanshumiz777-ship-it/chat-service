@@ -25,6 +25,7 @@ COPY --from=deps /usr/local/bin /usr/local/bin
 
 # Application code.
 COPY --chown=appuser:appuser app ./app
+COPY --chown=appuser:appuser content ./content
 
 USER appuser
 

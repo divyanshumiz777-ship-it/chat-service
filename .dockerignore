@@ -22,6 +22,7 @@ env/
 # Test + docs are not needed at runtime
 tests/
 *.md
+!content/help/*.md
 
 # VCS
 .git/
