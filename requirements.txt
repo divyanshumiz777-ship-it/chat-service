@@ -15,7 +15,16 @@ motor==3.6.0
 # Vector DB client (collection bootstrap + readiness; vectors/search wired later)
 qdrant-client==1.12.1
 
-# Embedding model (lazy-loaded on first use)
+# Embedding model (lazy-loaded on first use). sentence-transformers pulls in
+# torch unpinned, which resolves to the default PyPI wheel — a full
+# CUDA-enabled build (~2GB of nvidia-* runtime libraries) that this
+# CPU-only deployment never uses (see embedder.py: device is always "cpu").
+# On Render's 512Mi free tier, that extra weight was enough to OOM-kill the
+# container while loading the model at startup, before the port ever opened.
+# Pinning the CPU-only wheel (same torch version, no CUDA runtime) keeps
+# behavior identical while cutting both image size and import-time memory.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.7.1+cpu
 sentence-transformers==3.3.1
 
 # Groq generation (lazy-loaded; requires GROQ_API_KEY at runtime).
