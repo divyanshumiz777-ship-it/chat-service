@@ -50,11 +50,19 @@ class Intent(str, Enum):
     CONVERSATION_INSIGHTS = "conversation_insights"
     CONVERSATION_WITH_USER = "conversation_with_user"
     SUMMARIZE = "summarize"
+    # Concrete resolution of SUMMARIZE ("what did I miss", "summarize unread").
+    # Never produced by the router directly — internal._resolve_umbrella_intent
+    # maps SUMMARIZE onto it so the phrasing reaches the digest tool that
+    # already backs the Digest tab and the proactive modal.
+    CATCH_ME_UP = "catch_me_up"
     SUMMARIZE_CONVERSATION = "summarize_conversation"
     COMMUNITY_SUMMARY = "community_summary"
     CHANNEL_SUMMARY = "channel_summary"
     VOICE_SESSION_RECALL = "voice_session_recall"
     HELP = "help"
+    # "How does TheSocial work?" — answered from the hand-written help corpus
+    # (content/help/*.md). Distinct from HELP, which lists available commands.
+    PRODUCT_HELP = "product_help"
     QA = "qa"
     MIXED = "mixed"
 
@@ -69,6 +77,11 @@ _PLATFORM_WORDS = frozenset({
     "unread", "user", "users", "member", "members",
     "profile", "dm", "group", "post", "posts",
     "the social",
+    # Added: without these, natural phrasings degraded to Intent.CHAT (the
+    # domain-locked "greetings only" path) and produced a refusal. "Search
+    # people" and "Explain this platform" — both shipped as UI buttons —
+    # were failing on exactly this.
+    "people", "person", "platform", "profiles", "thesocial",
 })
 
 # Summarize the *current* conversation (the open DM / group chat). Checked
@@ -84,6 +97,42 @@ _PLATFORM_WORDS = frozenset({
 # routed to the dedicated MongoDB recommender tools — never RAG. Deliberately
 # require "suggest"/"recommend" (or an explicit "who should I…/people I may
 # know" phrase) so plain searches like "find AI communities" stay PLATFORM_SEARCH.
+# "How does TheSocial work?" — product/how-to questions, answered from the help
+# corpus. Requires an explicit how-to shape ("how do I", "what is a", "explain",
+# "where do I") so it can't swallow data questions like "what did I miss" or
+# "who are my friends", which are checked either before this or by their own
+# more specific rules.
+_PRODUCT_HELP_RE = re.compile(
+    r"^\s*(how (do|can|does|would) (i|you|it|we)\b"
+    r"|how (do i|to)\b"
+    # "what is a/an <noun>" is a product question ("what is a thread"), but
+    # "what is THE <noun>" is usually not ("what is the weather") — that must
+    # stay on the domain-refusal path, so `the` is deliberately excluded here
+    # and only allowed in the explicit "difference between" shape below.
+    r"|what (is|are) (a|an)\b"
+    r"|what'?s (a|an)\b"
+    r"|what(?:'s| is) the difference between\b"
+    r"|where (do|can) i\b"
+    r"|explain\b"
+    r"|tell me about (this|the) (platform|app|product|site)\b"
+    r"|how does (this|the) (platform|app|product|site)\b)",
+    re.IGNORECASE,
+)
+
+# "While you were away" phrasings. These are the digest question however the
+# user words it, including when they name a surface ("...in my communities"),
+# which is why this is checked ahead of every list/summary rule.
+_CATCH_ME_UP_RE = re.compile(
+    r"\bwhat('?s| is| did| have)?\s*(i|we)?\s*(miss|missed|been missing)\b"
+    r"|\bcatch me up\b"
+    r"|\bcatch up on\b"
+    r"|\bwhat('s| is| has)?\s+(new|happened)\b.{0,30}\b(while|since)\b"
+    r"|\bwhile i (was|were) (away|gone|offline)\b"
+    r"|\bsummari[sz]e\s+(my\s+)?unread\b"
+    r"|\banything new\b",
+    re.IGNORECASE,
+)
+
 _SUGGEST_FRIENDS_RE = re.compile(
     r"\b(suggest|recommend)\b.*\b(friends?|people|connections?)\b"
     r"|\bpeople i (may|might) know\b"
@@ -493,6 +542,22 @@ def route_intent(message: str) -> Intent:
         return cap.intent
 
     # 2. Regex fallback ─────────────────────────────────────────────────────────
+    # "What did I miss" / "catch me up" — checked FIRST among the regexes.
+    # These phrasings carry no platform noun of their own, so they used to fail
+    # the platform gate and land on the domain-locked chat prompt (a refusal);
+    # and the moment a noun was added ("...in my communities") they matched
+    # _LIST_COMMUNITIES_RE instead and merely listed communities. Both are the
+    # digest question, so answer it with the digest.
+    if _CATCH_ME_UP_RE.search(text):
+        return Intent.CATCH_ME_UP
+
+    # Product/how-to questions, answered from the help corpus. Checked after
+    # catch-me-up (so "what's new" stays the digest) but before the platform
+    # gate, because a question like "how do I create a community?" is exactly
+    # the kind that previously fell through to a domain refusal.
+    if _PRODUCT_HELP_RE.search(text):
+        return Intent.PRODUCT_HELP
+
     # Explicit recommenders — "suggest/recommend …" phrasing. Checked before the
     # platform gate, routed to the MongoDB recommender tools (never RAG).
     if _SUGGEST_FRIENDS_RE.search(text):

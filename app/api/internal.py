@@ -14,7 +14,8 @@ import asyncio
 import base64
 import logging
 import mimetypes
-from datetime import datetime
+import re
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
@@ -43,6 +44,7 @@ from app.llm.provider import (
     generate_community_summary,
     generate_conversation_summary,
     generate_moderation_triage,
+    generate_product_help,
     generate_reel_captions,
     generate_voice_session_summary,
     transcribe_audio_chunk,
@@ -69,7 +71,7 @@ from app.tools import (
     suggest_creators,
     suggest_friends,
 )
-from app.rag.ingest_sync import ingest_all, ingest_voice_session
+from app.rag.ingest_sync import ingest_all, ingest_one, ingest_voice_session
 from app.rag.delete_sync import (
     delete_by_channel,
     delete_by_conversation,
@@ -180,6 +182,13 @@ class DeleteContentRequest(BaseModel):
     source_type: str | None = None
 
 
+class IngestDocumentRequest(BaseModel):
+    # One of ingest_sync._ONE_DOC_SOURCES: server | channel | thread | reel | user.
+    # "message" is intentionally unsupported — see that dict's comment.
+    source_type: str
+    id: str
+
+
 @router.post("/delete", dependencies=[Depends(require_internal_token)])
 async def delete_content(request: DeleteContentRequest) -> dict:
     """Remove indexed content for a deleted server/channel/single source
@@ -207,6 +216,30 @@ async def delete_content(request: DeleteContentRequest) -> dict:
     else:
         raise HTTPException(status_code=400, detail=f"unknown scope: {request.scope!r}")
     return {"status": "ok"}
+
+
+@router.post("/ingest/document", dependencies=[Depends(require_internal_token)])
+async def ingest_document(request: IngestDocumentRequest) -> dict:
+    """Index one just-created/updated document — the Qdrant-side half of a
+    Mongo write, and the mirror image of /delete above.
+
+    Exists because /ingest (the full batch pass) had no caller and nothing
+    scheduled it, so new content was never searchable: RAG found nothing and
+    the assistant answered legitimate questions with a domain refusal.
+
+    Best-effort by design. The gateway calls this fire-and-forget after the
+    Mongo write has already committed, so a failure here costs freshness in
+    search, never the user's write.
+    """
+    result = await ingest_one(request.source_type, request.id)
+    return {
+        "status": "ok",
+        "sourceType": result.source_type,
+        "docs": result.docs,
+        "chunks": result.chunks,
+        "embeddings": result.embeddings,
+        "skipped": result.skipped,
+    }
 
 
 @router.get("/capabilities", dependencies=[Depends(require_internal_token)])
@@ -251,6 +284,89 @@ _RECOMMENDERS = {
 }
 
 
+# Object-noun → concrete recommender intent. Ordered longest-first at match time
+# so "communities" can't be shadowed by a shorter alternative.
+_RECOMMEND_OBJECTS: tuple[tuple[frozenset[str], "Intent"], ...] = (
+    (frozenset({"community", "communities", "server", "servers", "guild", "guilds"}),
+     Intent.SUGGEST_COMMUNITIES),
+    (frozenset({"friend", "friends", "people", "person", "user", "users", "member", "members"}),
+     Intent.SUGGEST_FRIENDS),
+    (frozenset({"creator", "creators", "influencer", "influencers"}),
+     Intent.SUGGEST_CREATORS),
+    # Reels have no dedicated recommender tool; the closest honest answer is
+    # "here are creators worth following", so route there rather than silently
+    # dropping into unscoped vector search.
+    (frozenset({"reel", "reels", "video", "videos"}), Intent.SUGGEST_CREATORS),
+)
+
+_WORD_RE = re.compile(r"[a-z]+")
+
+# Cheap question detector for the product-help safety net below. Deliberately
+# permissive on shape but NOT on cost: it only gates whether we spend one
+# embedding + docs lookup before falling back to the domain-locked reply.
+_QUESTION_RE = re.compile(
+    r"\?\s*$|^\s*(how|what|where|when|why|can i|can you|do i|does|is there|are there)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_a_question(message: str) -> bool:
+    return bool(_QUESTION_RE.search(message.strip()))
+
+
+# Minimum rerank score for a docs hit to count as "this question is about the
+# product" on the CHAT safety-net path. Chosen from measured behaviour against
+# the real corpus: real product questions land 0.51-0.65, off-topic ones
+# 0.19-0.24, so 0.40 sits in the gap with margin either side.
+#
+# Applies ONLY to the safety net. When the router has already decided this is a
+# how-to question (Intent.PRODUCT_HELP), a weak match should produce "I don't
+# have documentation on that yet" — a documentation gap — not a domain refusal.
+_DOCS_RELEVANCE_FLOOR = 0.40
+
+
+def _resolve_umbrella_intent(intent: "Intent", message: str) -> "Intent":
+    """Map the two handler-less umbrella intents onto real tools.
+
+    RECOMMENDATION ("suggest/recommend/discover/explore ...") is resolved by the
+    object noun in the message. SUMMARIZE ("what did I miss", "summarize unread")
+    becomes the catch-me-up digest, which is exactly what that phrasing means and
+    is already implemented for the digest surfaces.
+
+    Anything genuinely ambiguous is left alone so it keeps its existing RAG
+    behaviour rather than guessing wrong.
+    """
+    if intent is Intent.RECOMMENDATION:
+        words = set(_WORD_RE.findall(message.lower()))
+        for nouns, resolved in _RECOMMEND_OBJECTS:
+            if words & nouns:
+                return resolved
+        # No object noun ("give me some suggestions") — the social overview is a
+        # genuine answer that also shows what CAN be suggested, unlike a refusal.
+        return Intent.SOCIAL_OVERVIEW
+
+    if intent is Intent.SUMMARIZE:
+        return Intent.CATCH_ME_UP
+
+    return intent
+
+
+def _recommendation_href(item: dict) -> str | None:
+    """In-app link for one recommendation.
+
+    Paths mirror frontend/lib/searchResultLink.ts exactly — a community opens
+    at /community/<id> and a person at /profile/<id> — so recommendations and
+    search results send the user to the same place.
+    """
+    community_id = item.get("community_id")
+    if community_id:
+        return f"/community/{community_id}"
+    person_id = item.get("creator_id") or item.get("user_id")
+    if person_id:
+        return f"/profile/{person_id}"
+    return None
+
+
 def _format_recommendations(header: str, items: list[dict]) -> str:
     """Render recommender output deterministically (no LLM).
 
@@ -261,7 +377,13 @@ def _format_recommendations(header: str, items: list[dict]) -> str:
     """
     lines: list[str] = [header, ""]
     for i, item in enumerate(items, 1):
-        lines.append(f"{i}. {item.get('name', 'Unknown')}")
+        name = item.get("name", "Unknown")
+        href = _recommendation_href(item)
+        # Every recommender already returns the id; the reply just never used
+        # it, so a suggestion was a dead end — a name with no way to open it.
+        # Rendered as markdown because the panel renders answers through
+        # AssistantMarkdown, so this becomes a real link.
+        lines.append(f"{i}. [{name}]({href})" if href else f"{i}. {name}")
         lines.append("")
         lines.append("Reasons:")
         reasons = [str(r).strip() for r in (item.get("reasons") or []) if str(r).strip()]
@@ -1027,6 +1149,14 @@ async def chat(
         x_user_id, intent, parsed is not None, len(message),
     )
 
+    # RECOMMENDATION and SUMMARIZE are *umbrella* intents: the router raises them
+    # for phrasings like "discover communities" / "suggest some reels" / "what did
+    # I miss", but neither had a handler, so both fell all the way through to
+    # generic RAG and answered with whatever the vector index happened to hold —
+    # or, far more often, with a domain refusal. Resolve them to the concrete tool
+    # the user actually asked for before dispatch.
+    intent = _resolve_umbrella_intent(intent, message)
+
     # ── Tool intents — deterministic MongoDB responses (+ smart suggestions) ──────
     # The tool produces the data; replies are formatted deterministically (no LLM,
     # no Qdrant). _attach_suggestions adds related-command hints (Part 5).
@@ -1064,6 +1194,39 @@ async def chat(
             intent,
         )
 
+    # "What did I miss" / "summarize unread" — the same digest that backs the
+    # Digest tab and the proactive modal, rendered as a chat reply. Uses a fixed
+    # 24h lookback because a chat turn carries no away-duration signal (the
+    # digest surfaces get theirs from User.lastDisconnectedAt via the gateway).
+    if intent == Intent.CATCH_ME_UP:
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        data = await get_catch_me_up_data(x_user_id, since)
+        if data is None or data.total_message_count == 0:
+            return _attach_suggestions(
+                {
+                    "answer": "Nothing new in the last 24 hours across your communities and DMs.",
+                    "citations": [],
+                    "intent": intent,
+                },
+                intent,
+            )
+        answer = await generate_catch_me_up_digest(user_id=x_user_id, data=data)
+        return _attach_suggestions(
+            {"answer": answer, "citations": [], "intent": intent}, intent
+        )
+
+    # "How does TheSocial work?" — retrieve from the help corpus ONLY, so the
+    # answer can never drift into someone's messages or a community's content,
+    # and a documentation gap reads as a documentation gap.
+    if intent == Intent.PRODUCT_HELP:
+        doc_results = await search_all(
+            user_id=x_user_id, query=message, types=["docs"], top_k=6
+        )
+        answer = await generate_product_help(
+            user_id=x_user_id, query=message, results=doc_results
+        )
+        return {"answer": answer, "citations": [], "intent": intent}
+
     # Help / command menu — rendered from the registry (already a full menu, so no
     # suggestion footer is appended).
     if intent == Intent.HELP:
@@ -1071,6 +1234,31 @@ async def chat(
 
     # General conversation: skip Qdrant, call the domain-locked LLM directly.
     if intent == Intent.CHAT:
+        # Safety net before the domain refusal. _PRODUCT_HELP_RE can only match
+        # the how-to phrasings someone thought of; a question worded differently
+        # ("is there a way to hide a chat?") would otherwise be told the
+        # assistant only helps with TheSocial — while asking about TheSocial.
+        # Only for question-shaped messages, so a plain greeting stays instant.
+        if _looks_like_a_question(message):
+            doc_results = await search_all(
+                user_id=x_user_id, query=message, types=["docs"], top_k=6
+            )
+            # Relevance gate, not just presence: vector search always returns
+            # its nearest neighbours, so "what is the weather today" matched a
+            # help topic at 0.24 and got answered as product help instead of
+            # refused. Measured on this corpus, genuine product questions score
+            # 0.51-0.65 and off-topic ones 0.19-0.24 — see
+            # _DOCS_RELEVANCE_FLOOR.
+            if doc_results and doc_results[0].score >= _DOCS_RELEVANCE_FLOOR:
+                answer = await generate_product_help(
+                    user_id=x_user_id, query=message, results=doc_results
+                )
+                return {
+                    "answer": answer,
+                    "citations": [],
+                    "intent": Intent.PRODUCT_HELP,
+                }
+
         answer = await generate_chat_response(user_id=x_user_id, query=message)
         return {"answer": answer, "citations": [], "intent": intent}
 

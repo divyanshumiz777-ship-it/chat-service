@@ -30,6 +30,9 @@ _MAX_EFFECTIVE_K = 100
 _CANONICAL_TYPES = frozenset({
     "server", "channel", "thread", "reel", "user", "message", "notification",
     "voice_session",
+    # Product-help topics (content/help/*.md). Always public, no owner — see
+    # chunker.normalize_doc.
+    "docs",
 })
 _TYPE_ALIASES: dict[str, list[str]] = {
     "discordserver": ["server"],
@@ -58,6 +61,10 @@ _TYPE_ALIASES: dict[str, list[str]] = {
     "voice": ["voice_session"],
     "call": ["voice_session"],
     "calls": ["voice_session"],
+    "docs": ["docs"],
+    "doc": ["docs"],
+    "help": ["docs"],
+    "guide": ["docs"],
 }
 
 
@@ -230,6 +237,65 @@ async def search_private(
     return _dedup_by_source([_to_result(p) for p in raw])[:top_k]
 
 
+async def _drop_blocked(user_id: str, results: list[SearchResult]) -> list[SearchResult]:
+    """Remove results authored by someone on either side of a block.
+
+    Qdrant's own ACL filter (visibility + allowed_user_ids) is baked at ingest
+    time and knows nothing about blocks, so without this a blocked user's
+    public profile, reels and public-server messages still surfaced in /search
+    and in RAG answers — even though every MongoDB-backed tool filters blocks.
+
+    Bidirectional, matching the pattern in tools/catch_me_up.py: hide content
+    from people the caller blocked AND from people who blocked the caller.
+    Fails CLOSED on error (drops nothing only when there is nothing to check).
+    """
+    if not user_id or not results:
+        return results
+
+    owner_ids = {
+        str(r.metadata.get("owner_id"))
+        for r in results
+        if r.metadata.get("owner_id")
+    }
+    if not owner_ids:
+        return results
+
+    try:
+        from app.core.mongo import get_db
+        from app.tools._common import oid_set, to_oid
+
+        db = get_db()
+        user_oid = to_oid(user_id)
+        if user_oid is None:
+            return results
+
+        owner_oids = list(oid_set(owner_ids))
+        if not owner_oids:
+            return results
+
+        me, reverse_blocked_docs = await asyncio.gather(
+            db["users"].find_one({"_id": user_oid}, {"blockedUsers": 1}),
+            db["users"]
+            .find({"_id": {"$in": owner_oids}, "blockedUsers": user_oid}, {"_id": 1})
+            .to_list(length=None),
+        )
+
+        hidden = oid_set((me or {}).get("blockedUsers"))
+        hidden |= {d["_id"] for d in reverse_blocked_docs}
+        if not hidden:
+            return results
+
+        hidden_str = {str(o) for o in hidden}
+        return [
+            r for r in results
+            if str(r.metadata.get("owner_id") or "") not in hidden_str
+        ]
+    except Exception:
+        # A blocklist lookup failure must not silently widen visibility.
+        logger.exception("block filter failed user=%s — dropping owned results", user_id)
+        return [r for r in results if not r.metadata.get("owner_id")]
+
+
 async def search_all(
     user_id: str,
     query: str,
@@ -268,4 +334,5 @@ async def search_all(
 
     merged = [_to_result(p) for p in pub_raw + priv_raw]
     deduped = _dedup_by_source(merged)
-    return deduped[offset:offset + top_k]
+    visible = await _drop_blocked(user_id, deduped)
+    return visible[offset:offset + top_k]

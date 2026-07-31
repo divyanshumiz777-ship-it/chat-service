@@ -97,7 +97,16 @@ def _split_text(text: str) -> list[str]:
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-        start = end - _OVERLAP_CHARS
+
+        # Guarantee forward progress. `end` is always > start, but
+        # `end - _OVERLAP_CHARS` need not be: when the chosen sentence boundary
+        # lands within _OVERLAP_CHARS of `start` (a long passage whose only "."
+        # sits near the top of the window), the next iteration restarts at or
+        # BEFORE the current position and the loop never terminates — it
+        # appends the same chunk until the process runs out of memory. Give up
+        # the overlap for that one step rather than stall.
+        next_start = end - _OVERLAP_CHARS
+        start = next_start if next_start > start else end
     return chunks
 
 
@@ -109,6 +118,33 @@ def _make_chunks(text: str, payload: AclPayload) -> list[RagChunk]:
 
 
 # ── Source normalizers ─────────────────────────────────────────────────────────
+
+def normalize_doc(slug: str, title: str, body: str) -> list[RagChunk]:
+    """A product-help topic (content/help/*.md) — the only source that is NOT a
+    Mongo document.
+
+    These exist so the assistant can answer "how does X work on TheSocial?".
+    Previously it could not: the chat prompt forbids explaining anything, so
+    product questions got the same refusal as questions about the weather —
+    while the UI advertised "Explain the platform" as a capability.
+
+    Always public and owner-less: the corpus is hand-written, version
+    controlled, and identical for every user, so there is nothing to
+    access-control and nothing to attribute.
+    """
+    text = f"{title}\n{body}".strip()
+    if not text:
+        return []
+
+    payload = AclPayload(
+        source_type="docs",
+        source_id=slug,
+        visibility="public",
+        allowed_user_ids=[],
+        title=title,
+    )
+    return _make_chunks(text, payload)
+
 
 def normalize_server(doc: dict) -> list[RagChunk]:
     name = (doc.get("name") or "").strip()

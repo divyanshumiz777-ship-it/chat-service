@@ -33,6 +33,35 @@ async def collection_exists(name: str) -> bool:
     return bool(await get_client().collection_exists(name))
 
 
+# Payload keys that retriever._build_acl_filter filters on. Qdrant REQUIRES a
+# payload index for every filtered key — without one it rejects the search with
+# HTTP 400 ("Index required but not found for ..."), which _query_collection
+# catches and turns into an empty list. The observable symptom is that
+# semantic search silently returns nothing, always, for everyone: the two ACL
+# keys below are on the critical path of every single query.
+_FILTERED_PAYLOAD_KEYS = ("visibility", "allowed_user_ids", "source_type")
+
+
+async def _ensure_payload_indexes(client: Any, collection: str) -> None:
+    """Create the payload indexes the ACL filter depends on (idempotent)."""
+    from qdrant_client.models import PayloadSchemaType
+
+    for key in _FILTERED_PAYLOAD_KEYS:
+        try:
+            await client.create_payload_index(
+                collection_name=collection,
+                field_name=key,
+                field_schema=PayloadSchemaType.KEYWORD,
+                wait=True,
+            )
+            logger.info("qdrant payload index ready: %s.%s", collection, key)
+        except Exception as exc:
+            # Already-exists is the common, benign case; anything else is worth
+            # seeing, but must not stop startup — the service is still useful
+            # for every non-RAG capability.
+            logger.debug("payload index %s.%s not created: %s", collection, key, exc)
+
+
 async def bootstrap_collections() -> None:
     from qdrant_client.models import VectorParams
 
@@ -46,11 +75,17 @@ async def bootstrap_collections() -> None:
     ):
         if await client.collection_exists(name):
             logger.debug("qdrant collection %s already exists", name)
-            continue
-        await client.create_collection(
-            collection_name=name, vectors_config=vectors_config
-        )
-        logger.info("created qdrant collection %s", name)
+        else:
+            await client.create_collection(
+                collection_name=name, vectors_config=vectors_config
+            )
+            logger.info("created qdrant collection %s", name)
+
+        # Deliberately OUTSIDE the exists check: the collections in this
+        # deployment already existed but had no payload indexes, so an
+        # early-continue meant they were never backfilled and every search
+        # kept 400ing. Creating an existing index is a no-op.
+        await _ensure_payload_indexes(client, name)
 
 
 async def get_qdrant_status() -> str:

@@ -4,6 +4,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from app.config import get_settings
@@ -341,9 +342,14 @@ async def ingest_users(
         "no_visibility_setting=%d explicit_public=%d",
         src, skip_private, no_setting, explicit_public,
     )
-    query: dict[str, Any] = {
-        "settings.privacy.profileVisibility": {"$nin": ["private", "friends"]}
-    }
+    # Must match chunker.normalize_user's rule EXACTLY (profileVisibility ==
+    # "public"). This used to be a $nin, which in MongoDB also matches
+    # documents where the field is absent — so every user without an explicit
+    # setting was fetched, counted in FILTERED as though ingested, then
+    # silently discarded by the chunker, producing zero chunks. Matching
+    # strictly is also the privacy-safe direction: never index a profile that
+    # did not explicitly opt in to being public.
+    query: dict[str, Any] = {"settings.privacy.profileVisibility": "public"}
     if since:
         query["updatedAt"] = {"$gt": since}
 
@@ -355,16 +361,9 @@ async def ingest_users(
         logger.info("SOURCE=%s SKIPPED=all reason=no_documents_passed_filter", src)
         return result
 
-    n_explicit = sum(
-        1 for d in docs
-        if (d.get("settings") or {}).get("privacy", {}).get("profileVisibility") == "public"
-    )
-    n_fallback = result.docs - n_explicit
-    if n_fallback:
-        logger.debug(
-            "SOURCE=%s FILTERED_DETAIL explicit_public=%d fallback_no_setting=%d",
-            src, n_explicit, n_fallback,
-        )
+    # (The old "fallback_no_setting" diagnostic lived here. It counted docs the
+    # query let through but the chunker then dropped — impossible now that both
+    # match on profileVisibility == "public", so the branch could never fire.)
 
     source_ids = [str(d["_id"]) for d in docs]
     existing = await get_existing_hashes("user", source_ids)
@@ -443,6 +442,154 @@ async def ingest_messages(
     to_embed = _dedup(raw_chunks, existing, result)
     if to_embed:
         await _embed_and_upsert(to_embed, result)
+    return result
+
+
+_HELP_DIR = Path(__file__).resolve().parents[2] / "content" / "help"
+
+
+async def ingest_docs() -> IngestResult:
+    """Index the product-help corpus (content/help/*.md).
+
+    Unlike every other source these are files, not Mongo documents, so this is
+    also the only ingest that can be run without a database. It is called on
+    startup (app.main) rather than only from the batch pass, because product
+    help is small, static, and must never be missing — a user asking "how do I
+    create a community?" should not depend on someone having remembered to
+    trigger an ingest.
+
+    Dedup is skipped for the same reason as ingest_one: the hash table records
+    what was embedded once, not what currently exists in Qdrant. Embeddings are
+    content-hash cached in Redis, so re-running this is nearly free.
+    """
+    result = IngestResult(source_type="docs")
+
+    if not _HELP_DIR.is_dir():
+        logger.warning("help corpus missing at %s — product help disabled", _HELP_DIR)
+        return result
+
+    await _bootstrap()
+
+    chunks: list[RagChunk] = []
+    for path in sorted(_HELP_DIR.glob("*.md")):
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            logger.exception("could not read help topic %s", path.name)
+            continue
+        if not raw:
+            continue
+
+        # First "# Heading" is the topic title; the rest is the body.
+        lines = raw.splitlines()
+        if lines and lines[0].startswith("# "):
+            title = lines[0][2:].strip()
+            body = "\n".join(lines[1:]).strip()
+        else:
+            title = path.stem.replace("-", " ").title()
+            body = raw
+
+        result.docs += 1
+        chunks.extend(chunker.normalize_doc(path.stem, title, body))
+
+    result.chunks = len(chunks)
+    if chunks:
+        await _embed_and_upsert(chunks, result)
+    logger.info(
+        "SOURCE=docs topics=%d chunks=%d embedded=%d",
+        result.docs, result.chunks, result.embeddings,
+    )
+    return result
+
+
+# Targeted single-document ingest: source_type → (collection, needs server ACL).
+# Deliberately excludes `message`: chat is high-volume and indexing every send
+# would embed on the hot path. Messages stay on the batch pass until that is
+# designed with debouncing/batching.
+_ONE_DOC_SOURCES: dict[str, tuple[str, bool]] = {
+    "server": ("discordservers", False),
+    "channel": ("channels", True),
+    "thread": ("threads", True),
+    "reel": ("reels", False),
+    "user": ("users", False),
+}
+
+
+async def ingest_one(source_type: str, source_id: str) -> IngestResult:
+    """Index ONE document immediately, by id.
+
+    Exists because nothing ever triggered a full ingest: `/internal/v1/ingest`
+    had no caller and no scheduler, so newly created communities, channels,
+    threads, reels and profiles were never searchable — RAG returned nothing
+    and the domain-locked prompt answered with a refusal. The gateway now
+    calls this fire-and-forget after a write, mirroring how it already calls
+    delete-sync after a delete.
+
+    Deliberately does NOT consult the content-hash dedup table, for the same
+    reason ingest_voice_session doesn't: that table records "this text was
+    embedded once", not "a vector currently exists in Qdrant". The two drift
+    apart — bulk delete paths (delete_by_server/channel/conversation/group)
+    intentionally skip hash cleanup, and any Qdrant rebuild loses vectors while
+    leaving every hash row behind. A write-triggered re-index that consulted it
+    would then report success and index nothing, forever, for exactly the
+    documents most likely to need it. Verified live: a public server with a
+    surviving hash row and no vector was skipped on every attempt.
+
+    Re-embedding one document is cheap — embeddings are content-hash cached in
+    Redis, so unchanged text is a cache hit — and upserts are idempotent
+    (point ids are deterministic UUID-v5 of source_id:chunk_index).
+    """
+    result = IngestResult(source_type=source_type)
+
+    entry = _ONE_DOC_SOURCES.get(source_type)
+    if entry is None:
+        logger.warning("ingest_one: unsupported source_type=%s", source_type)
+        return result
+
+    collection, needs_server_meta = entry
+    # Lazy import: app.tools imports nothing from app.rag, so this direction is
+    # safe, but keep it local rather than widening module-level coupling.
+    from app.tools._common import to_oid
+
+    oid = to_oid(source_id)
+    if oid is None:
+        logger.warning("ingest_one: invalid source_id=%s", source_id)
+        return result
+
+    await _bootstrap()
+    db = get_db()
+    doc = await db[collection].find_one({"_id": oid})
+    if not doc:
+        # Already deleted, or never existed — delete-sync owns that path.
+        return result
+
+    if needs_server_meta:
+        meta_map = await _fetch_server_meta([doc["server"]] if doc.get("server") else [])
+        meta = meta_map.get(
+            str(doc.get("server", "")), {"visibility": "private", "member_ids": []}
+        )
+        normalize = (
+            chunker.normalize_channel if source_type == "channel" else chunker.normalize_thread
+        )
+        raw_chunks = normalize(doc, meta["visibility"], meta["member_ids"])
+    else:
+        normalize = {
+            "server": chunker.normalize_server,
+            "reel": chunker.normalize_reel,
+            "user": chunker.normalize_user,
+        }[source_type]
+        raw_chunks = normalize(doc)
+
+    result.docs = 1
+    result.chunks = len(raw_chunks)
+
+    # No chunks is a legitimate outcome, not an error: the chunker enforces its
+    # own visibility rules (a private profile, an unpublished reel), so this is
+    # how "indexed nothing, on purpose" looks.
+    if not raw_chunks:
+        return result
+
+    await _embed_and_upsert(raw_chunks, result)
     return result
 
 

@@ -64,6 +64,26 @@ Answer using ONLY the retrieved TheSocial context below. Follow these rules with
 5. Be concise. Do not repeat the question or restate context verbatim.
 6. Respect privacy: never speculate about content you were not given."""
 
+# Product-help mode: answers "how does TheSocial work?" from the hand-written
+# help corpus (content/help/*.md) only.
+#
+# This exists because the assistant previously could not explain the product it
+# lives inside: CHAT_SYSTEM_PROMPT forbids explaining anything, so "how do I
+# create a community?" got the same refusal as a question about the weather —
+# while the UI advertised "Explain the platform" as a capability. The outside-
+# world lock is unchanged; the corpus is the ONLY thing this mode may explain,
+# which is also what stops it inventing features TheSocial does not have.
+PRODUCT_HELP_SYSTEM_PROMPT = """You are TheSocial Copilot, the built-in assistant for TheSocial — a community platform of users, friends, creators, communities (also called servers, guilds, or workspaces), channels, threads, reels, comments, DMs, notifications, and feeds.
+
+The user is asking how TheSocial works. Answer from the help documentation below. Follow these rules without exception:
+
+1. Answer ONLY from the documentation provided. Never describe a feature, button, setting, or screen that is not in it — if TheSocial does not have something, do not invent it.
+2. If the documentation does not cover the question, say exactly: "I don't have documentation on that yet." Then suggest a related topic that IS covered.
+3. Be direct and practical. Give the steps in order. Prefer short numbered steps over prose.
+4. Never explain the outside world, other products (Discord, Slack, Reddit, Instagram, X, Facebook, etc.), public figures, news, code, or general knowledge.
+5. Do not cite source numbers or mention "the documentation" — just answer as the product's own guide.
+6. Be concise. Two or three short paragraphs at most, or a short numbered list."""
+
 # Chat mode: domain-locked. Greets and redirects only — never answers world knowledge.
 CHAT_SYSTEM_PROMPT = f"""You are TheSocial Copilot, the built-in assistant for TheSocial — a community platform of users, friends, creators, communities (also called servers, guilds, or workspaces), channels, threads, reels, comments, DMs, notifications, and feeds.
 
@@ -188,6 +208,9 @@ _TRANSCRIPT_MSG_LIMIT = 120
 _MAX_CONTEXT_CHARS = 6000    # ~1 500 tokens at 4 chars/token
 _MAX_RESULTS = 10            # cap number of context items sent to Gemini
 _EXCERPT_LIMIT = 400         # chars per result before truncation
+# Product help sends whole chunks rather than 400-char excerpts (see
+# build_docs_prompt), so it needs its own, larger budget.
+_MAX_DOCS_CONTEXT_CHARS = 8000
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -244,6 +267,42 @@ def build_prompt(query: str, results: list[SearchResult]) -> str:  # type: ignor
         "Instructions: Answer using ONLY the context above. "
         "Cite with [N] notation. "
         "If the context is insufficient, say so explicitly."
+    )
+
+
+def build_docs_prompt(query: str, results: list[SearchResult]) -> str:  # type: ignore[name-defined]
+    """Prompt for product-help answers, built from the help corpus.
+
+    Deliberately NOT build_prompt: that one truncates each excerpt to
+    _EXCERPT_LIMIT (400) chars, which cuts a 512-char help chunk mid-sentence —
+    observed live, where the two-factor topic arrived as "To turn it…" and the
+    model correctly concluded it had no instructions to give. It also instructs
+    "Cite with [N] notation", which contradicts the help persona and produced
+    footnote markers in what should read as the product's own guide.
+
+    So: whole chunks, no citation markers, generous budget. The corpus is small
+    and hand-written, so sending it in full is affordable.
+    """
+    blocks: list[str] = []
+    total = 0
+    for r in results[:6]:
+        excerpt = (r.metadata.get("excerpt") or "").strip()
+        if not excerpt:
+            continue
+        block = f"## {r.title}\n{excerpt}"
+        if total + len(block) > _MAX_DOCS_CONTEXT_CHARS:
+            break
+        blocks.append(block)
+        total += len(block)
+
+    context = "\n\n".join(blocks) if blocks else "(no documentation found)"
+    return (
+        f"TheSocial help documentation:\n\n{context}\n\n"
+        f"User question: {query}\n\n"
+        "Answer the question using only the documentation above. "
+        "Give concrete steps where the documentation describes them. "
+        "Do not use [1]-style citation markers and do not refer to "
+        "'the documentation' — answer as the product's own guide."
     )
 
 

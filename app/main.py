@@ -37,6 +37,24 @@ async def lifespan(_app: FastAPI):
         logger.info("Qdrant collections initialized")
     except Exception as exc:
         logger.error("Failed to initialize Qdrant: %s", exc)
+
+    # Product help is a small, static, version-controlled corpus, so index it on
+    # every start rather than relying on someone triggering an ingest. Without
+    # this, "how do I create a community?" depends on an operational step that
+    # nothing enforces — and the whole reason product help exists is that the
+    # assistant used to refuse those questions outright. Embeddings are
+    # content-hash cached, so repeat startups are nearly free.
+    try:
+        from app.rag.ingest_sync import ingest_docs
+
+        result = await ingest_docs()
+        logger.info(
+            "product help ready: %d topic(s), %d chunk(s)", result.docs, result.chunks
+        )
+    except Exception as exc:
+        # Never block startup: every non-help capability still works without it.
+        logger.error("Failed to index product help: %s", exc)
+
     yield
     logger.info("shutting down %s", settings.service_name)
 

@@ -23,12 +23,14 @@ from app.llm.prompts import (
     MODERATION_TRIAGE_SYSTEM_PROMPT,
     NO_DATA_FALLBACK,
     SUMMARY_SYSTEM_PROMPT,
+    PRODUCT_HELP_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     VOICE_SESSION_SUMMARY_SYSTEM_PROMPT,
     build_catch_me_up_prompt,
     build_channel_summary_prompt,
     build_community_summary_prompt,
     build_moderation_triage_prompt,
+    build_docs_prompt,
     build_prompt,
     build_summary_prompt,
     build_voice_session_summary_prompt,
@@ -50,6 +52,50 @@ logger = logging.getLogger(f"{settings.service_name}.provider")
 _UNAVAILABLE = "The AI assistant is not available right now. Please try again later."
 _GENERIC_ERROR = "I encountered an error while generating a response. Please try again."
 _EMPTY = NO_DATA_FALLBACK
+
+
+async def generate_product_help(
+    user_id: str,
+    query: str,
+    results: list[SearchResult],  # type: ignore[name-defined]
+) -> str:
+    """Answer a "how does TheSocial work?" question from the help corpus.
+
+    Same retrieval plumbing as generate_answer, but a different system prompt
+    and a different empty-state: falling back to NO_DATA_FALLBACK here would
+    tell a user asking a perfectly reasonable product question that there is
+    "no matching data", which reads as a bug rather than a documentation gap.
+    """
+    if not results:
+        return (
+            "I don't have documentation on that yet.\n\n"
+            "I can explain communities, channels, direct messages, reels, "
+            "friends and follows, voice channels, tips, privacy, notifications, "
+            "and account security."
+        )
+
+    prompt = build_docs_prompt(query=query, results=results)
+
+    try:
+        if settings.llm_provider == "groq":
+            from app.llm import groq_client
+
+            answer = await groq_client.complete(
+                system_prompt=PRODUCT_HELP_SYSTEM_PROMPT, user_prompt=prompt
+            )
+            return answer or _EMPTY
+
+        logger.error("unknown llm_provider configured: %s", settings.llm_provider)
+        return _UNAVAILABLE
+    except RuntimeError as exc:
+        logger.error("llm provider not configured: %s", exc)
+        return _UNAVAILABLE
+    except ImportError:
+        logger.error("llm provider SDK is not installed")
+        return _UNAVAILABLE
+    except Exception as exc:  # noqa: BLE001 - graceful degradation boundary
+        logger.error("generate_product_help failed for user %s: %s", user_id, exc)
+        return _GENERIC_ERROR
 
 
 async def generate_answer(
