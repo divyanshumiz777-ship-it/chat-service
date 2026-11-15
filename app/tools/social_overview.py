@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import get_settings
 from app.core.mongo import get_db
-from app.tools._common import oid_set, to_oid
+from app.tools._common import active_account_filter, oid_set, to_oid
 from app.tools.conversation_insights import _format_activity
 
 settings = get_settings()
@@ -119,7 +119,8 @@ async def _get_social_overview_impl(user_id: str) -> dict:
         )
         if reel_doc:
             creator_doc = await db["users"].find_one(
-                {"_id": reel_doc.get("creator_id")}, {"name": 1}
+                {"_id": reel_doc.get("creator_id"), **active_account_filter()},
+                {"name": 1},
             )
             if creator_doc:
                 most_active_creator = creator_doc.get("name")

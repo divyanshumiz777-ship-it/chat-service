@@ -173,11 +173,17 @@ async def build_conversation_summary(
     else:
         msg_filter["conversationId"] = conv_oid
 
-    raw_msgs = await db["messages"].find(msg_filter).sort("createdAt", 1).to_list(
-        length=_MAX_MESSAGES * 2
+    # Exclude messages this user deleted for themselves in the query itself, so
+    # the cap below counts only messages they can actually see.
+    msg_filter["deletedFor"] = {"$ne": user_oid}
+
+    # NEWEST first, capped, then flipped back to chronological order. This used
+    # to sort ascending and keep the first N — so "summarize this conversation"
+    # on any long chat summarized its very beginning, not what was just said.
+    raw_msgs = await db["messages"].find(msg_filter).sort("createdAt", -1).to_list(
+        length=_MAX_MESSAGES
     )
-    # Drop messages this user deleted for themselves.
-    raw_msgs = [m for m in raw_msgs if user_oid not in (m.get("deletedFor") or [])]
+    raw_msgs.reverse()
 
     participant_ids = conv.get("participants", [])
     sender_ids = [m.get("sender") for m in raw_msgs]

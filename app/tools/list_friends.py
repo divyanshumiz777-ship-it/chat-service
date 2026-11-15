@@ -11,7 +11,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.core.mongo import get_db
-from app.tools._common import oid_set, to_oid
+from app.tools._common import active_account_filter, oid_set, to_oid
 from app.tools.conversation_insights import _format_activity
 
 settings = get_settings()
@@ -40,7 +40,7 @@ async def _get_my_friends_impl(user_id: str, limit: int) -> list[dict]:
 
     db = get_db()
 
-    total_users = await db["users"].count_documents({})
+    total_users = await db["users"].estimated_document_count()
     logger.info("USER=%s MONGO_TOTAL=%d", user_id, total_users)
 
     me = await db["users"].find_one(
@@ -62,7 +62,7 @@ async def _get_my_friends_impl(user_id: str, limit: int) -> list[dict]:
 
     # Bulk-fetch friend profiles.
     friend_docs = await db["users"].find(
-        {"_id": {"$in": friend_oids}},
+        {"_id": {"$in": friend_oids}, **active_account_filter()},
         {"name": 1, "profilePic": 1, "servers": 1, "lastSeen": 1, "blockedUsers": 1},
     ).to_list(length=len(friend_oids))
 

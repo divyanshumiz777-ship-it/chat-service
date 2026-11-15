@@ -349,7 +349,10 @@ async def ingest_users(
     # silently discarded by the chunker, producing zero chunks. Matching
     # strictly is also the privacy-safe direction: never index a profile that
     # did not explicitly opt in to being public.
-    query: dict[str, Any] = {"settings.privacy.profileVisibility": "public"}
+    query: dict[str, Any] = {
+        "settings.privacy.profileVisibility": "public",
+        "accountStatus": {"$nin": ["deactivated", "deleted"]},
+    }
     if since:
         query["updatedAt"] = {"$gt": since}
 
@@ -559,8 +562,20 @@ async def ingest_one(source_type: str, source_id: str) -> IngestResult:
     await _bootstrap()
     db = get_db()
     doc = await db[collection].find_one({"_id": oid})
+
+    # Clear whatever is currently indexed for this document FIRST, in both
+    # collections. Upserting alone never removed anything: a server that went
+    # public → private kept its old point in the PUBLIC collection (same point
+    # id, different collection), a profile switched to private (zero chunks
+    # below) stayed searchable, and an edit that shortened the text left its
+    # old trailing chunks behind. delete_source is idempotent and also clears
+    # the rag_index_state rows, so the re-upsert below starts clean.
+    from app.rag.delete_sync import delete_source
+
+    await delete_source(source_type, str(oid))
+
     if not doc:
-        # Already deleted, or never existed — delete-sync owns that path.
+        # Already deleted, or never existed — nothing to re-index.
         return result
 
     if needs_server_meta:
@@ -584,8 +599,9 @@ async def ingest_one(source_type: str, source_id: str) -> IngestResult:
     result.chunks = len(raw_chunks)
 
     # No chunks is a legitimate outcome, not an error: the chunker enforces its
-    # own visibility rules (a private profile, an unpublished reel), so this is
-    # how "indexed nothing, on purpose" looks.
+    # own visibility rules (a private profile, an unpublished reel, a
+    # deactivated account), so this is how "indexed nothing, on purpose" looks
+    # — and the delete above has already removed anything stale.
     if not raw_chunks:
         return result
 

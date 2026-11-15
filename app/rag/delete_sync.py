@@ -20,8 +20,8 @@ from __future__ import annotations
 import logging
 
 from app.config import get_settings
-from app.rag.qdrant_client import delete_by_fields
-from app.rag.rag_document_index import delete_index_entries
+from app.rag.qdrant_client import delete_by_fields, scroll_source_ids
+from app.rag.rag_document_index import delete_index_entries, delete_index_entries_many
 
 settings = get_settings()
 logger = logging.getLogger(f"{settings.service_name}.delete_sync")
@@ -90,6 +90,53 @@ async def delete_by_group(group_id: str) -> None:
             logger.exception(
                 "qdrant delete_by_group failed for group=%s in %s", group_id, collection
             )
+
+
+async def delete_by_user(user_id: str) -> None:
+    """Remove everything indexed that is PERSONAL to `user_id` — called on
+    account deactivate and delete:
+
+      * the user's own profile point(s) (source_type "user"), so a deleted or
+        deactivated account stops surfacing in search/the assistant, and
+      * every notification point addressed to them (notifications are erased
+        from MongoDB on account deletion; their vectors must go too),
+
+    plus the matching rag_index_state rows. Content the user posted in shared
+    spaces (messages, reels, comments) is intentionally NOT touched here — it
+    stays, attributed to "Deleted user", and is removed by its own delete paths.
+    """
+    if not user_id:
+        raise ValueError("delete_by_user requires a user id")
+
+    notification_ids: set[str] = set()
+    for collection in _collections():
+        try:
+            notification_ids.update(
+                await scroll_source_ids(
+                    collection, {"source_type": "notification", "allowed_user_ids": user_id}
+                )
+            )
+        except Exception:
+            logger.exception(
+                "qdrant notification scan failed for user=%s in %s", user_id, collection
+            )
+        for conditions in (
+            {"source_type": "user", "source_id": user_id},
+            {"source_type": "notification", "allowed_user_ids": user_id},
+        ):
+            try:
+                await delete_by_fields(collection, conditions)
+            except Exception:
+                logger.exception(
+                    "qdrant delete_by_user failed for user=%s (%s) in %s",
+                    user_id, conditions["source_type"], collection,
+                )
+
+    try:
+        await delete_index_entries("user", user_id)
+        await delete_index_entries_many("notification", sorted(notification_ids))
+    except Exception:
+        logger.exception("rag_index_state cleanup failed for user=%s", user_id)
 
 
 async def delete_source(source_type: str, source_id: str) -> None:

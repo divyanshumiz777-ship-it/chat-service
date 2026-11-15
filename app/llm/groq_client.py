@@ -8,7 +8,8 @@ event loop is never blocked.
 Provider implementation detail: callers go through app.llm.provider, which keeps
 the rest of the application unaware of the concrete LLM backend.
 
-NO tool calling. NO conversation memory. NO assistant endpoints. NO summarization.
+NO tool calling. Conversation memory is caller-supplied per request (`history`);
+nothing is stored here.
 """
 
 from __future__ import annotations
@@ -62,7 +63,11 @@ def reset_client() -> None:
 
 # ── Generation ───────────────────────────────────────────────────────────────
 
-async def complete(system_prompt: str, user_prompt: str) -> str:
+async def complete(
+    system_prompt: str,
+    user_prompt: str,
+    history: list[dict] | None = None,
+) -> str:
     """Run a chat completion, walking the configured model fallback chain.
 
     Tries the primary model first, then each fallback in order. The SDK applies
@@ -72,10 +77,15 @@ async def complete(system_prompt: str, user_prompt: str) -> str:
     user-facing message (this function never returns a stack trace).
     """
     client = get_client()
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
+    # Prior turns of the same assistant conversation (oldest first). Only the
+    # two chat roles are forwarded — a client can never inject a "system" turn.
+    for turn in history or []:
+        role = turn.get("role")
+        content = str(turn.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_prompt})
 
     last_error: Exception | None = None
     for model in settings.groq_model_chain:

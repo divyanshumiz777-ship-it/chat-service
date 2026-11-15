@@ -16,6 +16,7 @@ import logging
 import mimetypes
 import re
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
@@ -77,6 +78,7 @@ from app.rag.delete_sync import (
     delete_by_conversation,
     delete_by_group,
     delete_by_server,
+    delete_by_user,
     delete_source,
 )
 
@@ -87,9 +89,31 @@ logger = logging.getLogger(f"{settings.service_name}.api.internal")
 
 # ── Request models ─────────────────────────────────────────────────────────────
 
+_HISTORY_MAX_TURNS = 6
+_HISTORY_TURN_MAX_CHARS = 1000
+
+
+class HistoryTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(max_length=4000)
     conversation_id: str | None = None  # reserved; persistence not yet implemented
+    # Prior turns of THIS assistant conversation (oldest first), supplied by
+    # the client via the gateway — nothing is stored server-side. Clamped by
+    # clamped_history(), never trusted for size.
+    history: list[HistoryTurn] = Field(default_factory=list, max_length=50)
+
+    def clamped_history(self) -> list[dict]:
+        """Last _HISTORY_MAX_TURNS non-empty turns, each truncated."""
+        turns = [
+            {"role": t.role, "content": t.content.strip()[:_HISTORY_TURN_MAX_CHARS]}
+            for t in self.history
+            if t.content and t.content.strip()
+        ]
+        return turns[-_HISTORY_MAX_TURNS:]
 
 
 class SearchRequest(BaseModel):
@@ -137,6 +161,10 @@ class ReelCaptionsRequest(BaseModel):
     video_url: str
 
 
+# ~2 MB of decoded audio (base64 is 4 chars per 3 bytes).
+_MAX_AUDIO_CHUNK_B64_CHARS = (2 * 1024 * 1024 * 4) // 3 + 4
+
+
 class TranscribeChunkRequest(BaseModel):
     # Base64 JSON rather than multipart — chunks are small (a few seconds of
     # opus-encoded audio), and this reuses the gateway's existing JSON-only
@@ -174,7 +202,7 @@ async def ping() -> dict:
 
 
 class DeleteContentRequest(BaseModel):
-    scope: str  # "server" | "channel" | "source" | "conversation" | "group"
+    scope: str  # "server" | "channel" | "source" | "conversation" | "group" | "user"
     id: str
     # Required only when scope == "source" — which content-type table the id
     # belongs to (e.g. "thread", "message"). Ignored for "server"/"channel"
@@ -207,6 +235,12 @@ async def delete_content(request: DeleteContentRequest) -> dict:
         await delete_by_conversation(request.id)
     elif request.scope == "group":
         await delete_by_group(request.id)
+    elif request.scope == "user":
+        # Account deactivate/delete: the user's own profile point(s) and every
+        # notification addressed to them (see delete_sync.delete_by_user).
+        if not request.id.strip():
+            raise HTTPException(status_code=400, detail="id is required")
+        await delete_by_user(request.id.strip())
     elif request.scope == "source":
         if not request.source_type:
             raise HTTPException(
@@ -308,6 +342,24 @@ _QUESTION_RE = re.compile(
     r"\?\s*$|^\s*(how|what|where|when|why|can i|can you|do i|does|is there|are there)\b",
     re.IGNORECASE,
 )
+
+
+_FOLLOW_UP_MAX_WORDS = 6
+
+
+def _retrieval_query(message: str, history: list[dict]) -> str:
+    """Text to embed for retrieval.
+
+    A short follow-up ("and yesterday?", "what about Sam?") embeds to almost
+    nothing on its own, so it's combined with the previous user question.
+    Intent routing still uses the current message only.
+    """
+    if len(message.split()) >= _FOLLOW_UP_MAX_WORDS:
+        return message
+    previous = next(
+        (t["content"] for t in reversed(history) if t.get("role") == "user"), None
+    )
+    return f"{previous}\n{message}" if previous else message
 
 
 def _looks_like_a_question(message: str) -> bool:
@@ -1139,6 +1191,7 @@ async def chat(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="message must not be empty",
         )
+    history = request.clamped_history()
 
     # Slash command? Resolve it (and any args) from the Capability Registry first;
     # otherwise classify natural language via the router (registry alias → regex).
@@ -1220,10 +1273,13 @@ async def chat(
     # and a documentation gap reads as a documentation gap.
     if intent == Intent.PRODUCT_HELP:
         doc_results = await search_all(
-            user_id=x_user_id, query=message, types=["docs"], top_k=6
+            user_id=x_user_id,
+            query=_retrieval_query(message, history),
+            types=["docs"],
+            top_k=6,
         )
         answer = await generate_product_help(
-            user_id=x_user_id, query=message, results=doc_results
+            user_id=x_user_id, query=message, results=doc_results, history=history
         )
         return {"answer": answer, "citations": [], "intent": intent}
 
@@ -1241,7 +1297,10 @@ async def chat(
         # Only for question-shaped messages, so a plain greeting stays instant.
         if _looks_like_a_question(message):
             doc_results = await search_all(
-                user_id=x_user_id, query=message, types=["docs"], top_k=6
+                user_id=x_user_id,
+                query=_retrieval_query(message, history),
+                types=["docs"],
+                top_k=6,
             )
             # Relevance gate, not just presence: vector search always returns
             # its nearest neighbours, so "what is the weather today" matched a
@@ -1251,7 +1310,7 @@ async def chat(
             # _DOCS_RELEVANCE_FLOOR.
             if doc_results and doc_results[0].score >= _DOCS_RELEVANCE_FLOOR:
                 answer = await generate_product_help(
-                    user_id=x_user_id, query=message, results=doc_results
+                    user_id=x_user_id, query=message, results=doc_results, history=history
                 )
                 return {
                     "answer": answer,
@@ -1259,21 +1318,30 @@ async def chat(
                     "intent": Intent.PRODUCT_HELP,
                 }
 
-        answer = await generate_chat_response(user_id=x_user_id, query=message)
+        answer = await generate_chat_response(
+            user_id=x_user_id, query=message, history=history
+        )
         return {"answer": answer, "citations": [], "intent": intent}
 
     # ── Platform / RAG path ───────────────────────────────────────────────────────
     # A slash search may override the query and scope it to specific source types.
     query = parsed.query if (parsed is not None and parsed.query) else message
     types = parsed.types if parsed is not None else None
-    results = await search_all(user_id=x_user_id, query=query, types=types)
+    # Natural-language follow-ups borrow the previous question for retrieval;
+    # an explicit slash search is used exactly as typed.
+    retrieval_query = query if parsed is not None else _retrieval_query(query, history)
+    results = await search_all(user_id=x_user_id, query=retrieval_query, types=types)
 
     # Mixed intent with no RAG results: fall back to conversational LLM
     if intent == Intent.MIXED and not results:
-        answer = await generate_chat_response(user_id=x_user_id, query=message)
+        answer = await generate_chat_response(
+            user_id=x_user_id, query=message, history=history
+        )
         return {"answer": answer, "citations": [], "intent": intent}
 
-    answer = await generate_answer(user_id=x_user_id, query=query, results=results)
+    answer = await generate_answer(
+        user_id=x_user_id, query=query, results=results, history=history
+    )
     return {
         "answer": answer,
         "citations": build_citations(results),
@@ -1522,6 +1590,12 @@ async def transcribe_voice_chunk(request: TranscribeChunkRequest) -> dict:
     connection — this endpoint is purely "audio bytes in, text out," so no
     X-User-Id or session state is needed here.
     """
+    # A live-caption chunk is a few seconds of opus audio (tens of KB). Refuse
+    # anything far larger before decoding it — otherwise any caller holding
+    # the gateway path could push arbitrarily large payloads straight to Groq.
+    if len(request.audio_base64) > _MAX_AUDIO_CHUNK_B64_CHARS:
+        raise HTTPException(status_code=413, detail="audio chunk too large")
+
     try:
         audio_bytes = base64.b64decode(request.audio_base64, validate=True)
     except Exception as exc:

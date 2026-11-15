@@ -239,9 +239,13 @@ def normalize_reel(doc: dict) -> list[RagChunk]:
 
 
 def normalize_user(doc: dict) -> list[RagChunk]:
-    """User — only profileVisibility="public"."""
+    """User — only profileVisibility="public" on an active account."""
     privacy = doc.get("settings", {}).get("privacy", {})
     if privacy.get("profileVisibility") != "public":
+        return []
+    # Deactivated profiles are hidden everywhere else in the app, and a
+    # deleted account's profile must not be indexed at all.
+    if doc.get("accountStatus") in ("deactivated", "deleted"):
         return []
 
     name = doc.get("name", "").strip()

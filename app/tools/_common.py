@@ -10,6 +10,23 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 
+# Account lifecycle (backend/src/lib/accountStatus.ts). A missing field means
+# "active". Deactivated accounts are hidden from every discovery surface; a
+# deleted account's document is an anonymized tombstone that must never be
+# suggested or listed as a person.
+INACTIVE_ACCOUNT_STATUSES = ["deactivated", "deleted"]
+
+
+def active_account_filter() -> dict:
+    """Mongo filter fragment matching only active accounts."""
+    return {"accountStatus": {"$nin": list(INACTIVE_ACCOUNT_STATUSES)}}
+
+
+def is_active_account(doc: dict | None) -> bool:
+    """True for an existing, active account document (missing field = active)."""
+    return bool(doc) and doc.get("accountStatus") not in INACTIVE_ACCOUNT_STATUSES
+
+
 def to_oid(value: Any) -> Any | None:
     """Coerce a value to a bson ObjectId, or None if it isn't a valid id."""
     from bson import ObjectId

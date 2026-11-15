@@ -296,6 +296,132 @@ async def _drop_blocked(user_id: str, results: list[SearchResult]) -> list[Searc
         return [r for r in results if not r.metadata.get("owner_id")]
 
 
+_INACTIVE_ACCOUNT_STATUSES = ["deactivated", "deleted"]
+
+
+def _needs_access_check(r: SearchResult) -> bool:
+    md = r.metadata
+    return bool(
+        md.get("server_id")
+        or md.get("conversation_id")
+        or md.get("group_id")
+        or r.source_type in ("user", "reel")
+    )
+
+
+async def _drop_inaccessible(user_id: str, results: list[SearchResult]) -> list[SearchResult]:
+    """Re-check every result against CURRENT MongoDB state.
+
+    Qdrant's ACL (visibility + allowed_user_ids) is a snapshot taken when the
+    chunk was indexed, and re-indexing skips unchanged text — so it never sees
+    a member leaving or being banned from a private server, a server switching
+    from public to private, someone leaving a group, a profile going private,
+    or an account being deactivated/deleted. Without this, all of those stayed
+    searchable through the assistant indefinitely.
+
+    Rules (mirroring the backend's own access checks):
+      server_id        → server exists AND (public OR caller owns it OR caller
+                         has a non-banned ServerMember row — the collection the
+                         backend's join-server/canJoinVoiceChannel trust)
+      conversation_id  → caller is in conversations.participants
+      group_id         → caller is in groups.participants
+      source_type user → profile is public AND account is active
+      source_type reel → reel exists, not deleted, not private
+
+    One batched query per collection. FAILS CLOSED: if any lookup errors,
+    every result that needed a check is dropped.
+    """
+    if not results:
+        return results
+    to_check = [r for r in results if _needs_access_check(r)]
+    if not to_check:
+        return results
+
+    try:
+        from app.core.mongo import get_db
+        from app.tools._common import oid_set, to_oid
+
+        user_oid = to_oid(user_id)
+        if user_oid is None:
+            return [r for r in results if not _needs_access_check(r)]
+
+        def ids(key: str) -> set:
+            return oid_set(r.metadata.get(key) for r in to_check)
+
+        server_oids = ids("server_id")
+        conv_oids = ids("conversation_id")
+        group_oids = ids("group_id")
+        profile_oids = oid_set(r.source_id for r in to_check if r.source_type == "user")
+        reel_oids = oid_set(r.source_id for r in to_check if r.source_type == "reel")
+
+        db = get_db()
+
+        async def visible_servers() -> set[str]:
+            if not server_oids:
+                return set()
+            servers = await db["discordservers"].find(
+                {"_id": {"$in": list(server_oids)}}, {"visibility": 1, "owner": 1}
+            ).to_list(length=None)
+            ok = {
+                str(s["_id"]) for s in servers
+                if s.get("visibility") == "public" or s.get("owner") == user_oid
+            }
+            restricted = [s["_id"] for s in servers if str(s["_id"]) not in ok]
+            if restricted:
+                rows = await db["servermembers"].find(
+                    {
+                        "server": {"$in": restricted},
+                        "user": user_oid,
+                        "banned.isBanned": {"$ne": True},
+                    },
+                    {"server": 1},
+                ).to_list(length=None)
+                ok |= {str(m["server"]) for m in rows}
+            return ok
+
+        async def matching(collection: str, oids: set, extra: dict) -> set[str]:
+            if not oids:
+                return set()
+            docs = await db[collection].find(
+                {"_id": {"$in": list(oids)}, **extra}, {"_id": 1}
+            ).to_list(length=None)
+            return {str(d["_id"]) for d in docs}
+
+        ok_servers, ok_convs, ok_groups, ok_profiles, ok_reels = await asyncio.gather(
+            visible_servers(),
+            matching("conversations", conv_oids, {"participants": user_oid}),
+            matching("groups", group_oids, {"participants": user_oid}),
+            matching(
+                "users",
+                profile_oids,
+                {
+                    "settings.privacy.profileVisibility": "public",
+                    "accountStatus": {"$nin": _INACTIVE_ACCOUNT_STATUSES},
+                },
+            ),
+            matching("reels", reel_oids, {"isDeleted": {"$ne": True}, "isPublic": {"$ne": False}}),
+        )
+    except Exception:
+        logger.exception("access re-check failed user=%s — dropping checked results", user_id)
+        return [r for r in results if not _needs_access_check(r)]
+
+    def allowed(r: SearchResult) -> bool:
+        md = r.metadata
+        if md.get("server_id") and str(md["server_id"]) not in ok_servers:
+            return False
+        if md.get("conversation_id") and str(md["conversation_id"]) not in ok_convs:
+            return False
+        if md.get("group_id") and str(md["group_id"]) not in ok_groups:
+            return False
+        if r.source_type == "user" and str(r.source_id) not in ok_profiles:
+            return False
+        if r.source_type == "reel" and str(r.source_id) not in ok_reels:
+            return False
+        return True
+
+    return [r for r in results if allowed(r)]
+
+
 async def search_all(
     user_id: str,
     query: str,
@@ -335,4 +461,5 @@ async def search_all(
     merged = [_to_result(p) for p in pub_raw + priv_raw]
     deduped = _dedup_by_source(merged)
     visible = await _drop_blocked(user_id, deduped)
+    visible = await _drop_inaccessible(user_id, visible)
     return visible[offset:offset + top_k]

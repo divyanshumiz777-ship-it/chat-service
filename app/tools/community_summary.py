@@ -17,6 +17,12 @@ from typing import Any
 
 from app.config import get_settings
 from app.core.mongo import get_db
+from app.tools._access import (
+    can_view,
+    member_server_oids,
+    resolve_channel_by_name,
+    resolve_server_by_name,
+)
 from app.tools._common import to_oid
 
 settings = get_settings()
@@ -105,13 +111,8 @@ async def _load_names(db: Any, ids: list[Any]) -> dict[str, str]:
     return {str(d["_id"]): (d.get("name") or "Unknown") for d in docs}
 
 
-def _can_view(server: dict, user_oid: Any) -> bool:
-    """True when the user may view this server (public, or user is a member)."""
-    if server.get("visibility") == "public":
-        return True
-    if user_oid is None:
-        return False
-    return any(m.get("user") == user_oid for m in (server.get("members") or []))
+# Access checks live in app/tools/_access.py (owner or non-banned ServerMember,
+# mirroring the backend) — shared with voice_session_recall.py.
 
 
 # ── Community summary ──────────────────────────────────────────────────────────
@@ -141,15 +142,14 @@ async def _community_summary_impl(
     db = get_db()
 
     proj = {
-        "name": 1, "description": 1, "visibility": 1,
+        "name": 1, "description": 1, "visibility": 1, "owner": 1,
         "members": 1, "channels": 1, "createdAt": 1,
     }
 
     if community_name:
-        server = await db["discordservers"].find_one(
-            {"name": {"$regex": f"^{re.escape(community_name)}$", "$options": "i"}},
-            proj,
-        )
+        # Names aren't unique: prefer a server the caller belongs to, then a
+        # public one — never an arbitrary (possibly private) match.
+        server, is_member = await resolve_server_by_name(db, user_oid, community_name, proj)
     else:
         if not user_oid:
             return None
@@ -158,18 +158,18 @@ async def _community_summary_impl(
             proj,
             sort=[("updatedAt", -1)],
         )
+        member_oids = await member_server_oids(
+            db, user_oid, [server["_id"]] if server else []
+        )
+        if not can_view(server, member_oids):
+            return None
+        is_member = server["_id"] in member_oids
 
     if server is None:
         return None
 
-    if not _can_view(server, user_oid):
-        return None
-
     server_oid = server["_id"]
     members = server.get("members") or []
-    is_member = user_oid is not None and any(
-        m.get("user") == user_oid for m in members
-    )
 
     # Channels
     channel_oids = server.get("channels") or []
@@ -266,39 +266,24 @@ async def _channel_summary_impl(
     user_oid = to_oid(user_id)
     db = get_db()
 
-    ch_filter: dict[str, Any] = {
-        "name": {"$regex": f"^{re.escape(channel_name)}$", "$options": "i"},
-    }
-
-    # Scope to a specific server when a community name is provided
-    if community_name:
-        srv = await db["discordservers"].find_one(
-            {"name": {"$regex": f"^{re.escape(community_name)}$", "$options": "i"}},
-            {"_id": 1, "visibility": 1, "members": 1},
-        )
-        if srv:
-            ch_filter["server"] = srv["_id"]
-
-    channel = await db["channels"].find_one(
-        ch_filter, {"name": 1, "server": 1, "thread": 1, "type": 1}
+    # Channel names repeat across servers ("general" is everywhere): resolve to
+    # the caller's own server first, then a public one. Access is enforced by
+    # the resolver — a channel whose server the caller can't see is never
+    # returned (and a channel with no server document is no longer allowed).
+    resolved = await resolve_channel_by_name(
+        db,
+        user_oid,
+        channel_name,
+        community_name=community_name,
+        channel_projection={"thread": 1},
+        prefer_types=("Text",),
     )
-    if channel is None:
+    if resolved is None:
         return None
+    channel, server_doc, _is_member = resolved
 
     channel_oid = channel["_id"]
-    server_oid = channel.get("server")
-
-    # ACL via server visibility
-    server_doc: dict | None = None
-    if server_oid:
-        server_doc = await db["discordservers"].find_one(
-            {"_id": server_oid},
-            {"name": 1, "visibility": 1, "members": 1},
-        )
-    if server_doc and not _can_view(server_doc, user_oid):
-        return None
-
-    server_name = (server_doc or {}).get("name") or "Unknown Server"
+    server_name = server_doc.get("name") or "Unknown Server"
 
     # Messages in this channel
     raw_msgs = await db["messages"].find(

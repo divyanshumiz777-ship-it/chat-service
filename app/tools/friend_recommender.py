@@ -21,7 +21,7 @@ from collections import defaultdict
 
 from app.config import get_settings
 from app.core.mongo import get_db
-from app.tools._common import is_recent, oid_set, plural, to_oid, top_n
+from app.tools._common import active_account_filter, is_recent, oid_set, plural, to_oid, top_n
 
 settings = get_settings()
 logger = logging.getLogger(f"{settings.service_name}.friend_recommender")
@@ -138,7 +138,7 @@ async def _suggest_friends_impl(user_id: str, limit: int) -> list[dict]:
     # ── Bulk-load candidate signals ──────────────────────────────────────────
     users_map: dict = {}
     async for u in db["users"].find(
-        {"_id": {"$in": cand_list}},
+        {"_id": {"$in": cand_list}, **active_account_filter()},
         {"name": 1, "profilePic": 1, "friends": 1, "servers": 1, "lastSeen": 1},
     ):
         users_map[u["_id"]] = u

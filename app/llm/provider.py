@@ -15,6 +15,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from app.config import get_settings
+from app.llm.output_sanitizer import sanitize_llm_output
 from app.llm.prompts import (
     CATCH_ME_UP_SYSTEM_PROMPT,
     CHANNEL_SUMMARY_SYSTEM_PROMPT,
@@ -58,6 +59,7 @@ async def generate_product_help(
     user_id: str,
     query: str,
     results: list[SearchResult],  # type: ignore[name-defined]
+    history: list[dict] | None = None,
 ) -> str:
     """Answer a "how does TheSocial work?" question from the help corpus.
 
@@ -81,9 +83,11 @@ async def generate_product_help(
             from app.llm import groq_client
 
             answer = await groq_client.complete(
-                system_prompt=PRODUCT_HELP_SYSTEM_PROMPT, user_prompt=prompt
+                system_prompt=PRODUCT_HELP_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                history=history,
             )
-            return answer or _EMPTY
+            return sanitize_llm_output(answer) or _EMPTY
 
         logger.error("unknown llm_provider configured: %s", settings.llm_provider)
         return _UNAVAILABLE
@@ -102,6 +106,7 @@ async def generate_answer(
     user_id: str,
     query: str,
     results: list[SearchResult],  # type: ignore[name-defined]
+    history: list[dict] | None = None,
 ) -> str:
     """Generate a grounded answer from retrieved context. Never raises.
 
@@ -120,9 +125,9 @@ async def generate_answer(
             from app.llm import groq_client
 
             answer = await groq_client.complete(
-                system_prompt=SYSTEM_PROMPT, user_prompt=prompt
+                system_prompt=SYSTEM_PROMPT, user_prompt=prompt, history=history
             )
-            return answer or _EMPTY
+            return sanitize_llm_output(answer) or _EMPTY
 
         logger.error("unknown llm_provider configured: %s", settings.llm_provider)
         return _UNAVAILABLE
@@ -137,7 +142,9 @@ async def generate_answer(
         return _GENERIC_ERROR
 
 
-async def generate_chat_response(user_id: str, query: str) -> str:
+async def generate_chat_response(
+    user_id: str, query: str, history: list[dict] | None = None
+) -> str:
     """Generate a conversational response without RAG context. Never raises.
 
     Used for general conversation intents (greetings, jokes, general knowledge)
@@ -146,15 +153,18 @@ async def generate_chat_response(user_id: str, query: str) -> str:
     Args:
         user_id:  Caller identity (used for audit/log only).
         query:    The raw user message.
+        history:  Prior turns of this assistant conversation (oldest first),
+                  already clamped by the API layer — lets follow-ups like
+                  "and what about yesterday?" resolve against the last turn.
     """
     try:
         if settings.llm_provider == "groq":
             from app.llm import groq_client
 
             answer = await groq_client.complete(
-                system_prompt=CHAT_SYSTEM_PROMPT, user_prompt=query
+                system_prompt=CHAT_SYSTEM_PROMPT, user_prompt=query, history=history
             )
-            return answer or _EMPTY
+            return sanitize_llm_output(answer) or _EMPTY
 
         logger.error("unknown llm_provider configured: %s", settings.llm_provider)
         return _UNAVAILABLE
@@ -191,7 +201,7 @@ async def generate_conversation_summary(
             answer = await groq_client.complete(
                 system_prompt=SUMMARY_SYSTEM_PROMPT, user_prompt=prompt
             )
-            return answer or _EMPTY
+            return sanitize_llm_output(answer) or _EMPTY
 
         logger.error("unknown llm_provider configured: %s", settings.llm_provider)
         return _UNAVAILABLE
@@ -219,7 +229,7 @@ async def generate_community_summary(
             answer = await groq_client.complete(
                 system_prompt=COMMUNITY_SUMMARY_SYSTEM_PROMPT, user_prompt=prompt
             )
-            return answer or _EMPTY
+            return sanitize_llm_output(answer) or _EMPTY
 
         logger.error("unknown llm_provider configured: %s", settings.llm_provider)
         return _UNAVAILABLE
@@ -247,7 +257,7 @@ async def generate_channel_summary(
             answer = await groq_client.complete(
                 system_prompt=CHANNEL_SUMMARY_SYSTEM_PROMPT, user_prompt=prompt
             )
-            return answer or _EMPTY
+            return sanitize_llm_output(answer) or _EMPTY
 
         logger.error("unknown llm_provider configured: %s", settings.llm_provider)
         return _UNAVAILABLE
@@ -283,7 +293,7 @@ async def generate_catch_me_up_digest(
             answer = await groq_client.complete(
                 system_prompt=CATCH_ME_UP_SYSTEM_PROMPT, user_prompt=prompt
             )
-            return answer or _EMPTY
+            return sanitize_llm_output(answer) or _EMPTY
 
         logger.error("unknown llm_provider configured: %s", settings.llm_provider)
         return _UNAVAILABLE
@@ -343,7 +353,7 @@ async def generate_moderation_triage(
             )
             if not raw:
                 return None
-            return _parse_moderation_triage(raw)
+            return _parse_moderation_triage(sanitize_llm_output(raw))
 
         logger.error("unknown llm_provider configured: %s", settings.llm_provider)
         return None
@@ -389,7 +399,7 @@ async def generate_voice_session_summary(
         answer = await groq_client.complete(
             system_prompt=VOICE_SESSION_SUMMARY_SYSTEM_PROMPT, user_prompt=prompt
         )
-        return answer.strip() or None
+        return sanitize_llm_output(answer) or None
     except RuntimeError as exc:
         logger.error("llm provider not configured: %s", exc)
         return None
@@ -446,6 +456,71 @@ _MAX_TRANSCRIBE_BYTES = 25 * 1024 * 1024
 _VIDEO_DOWNLOAD_TIMEOUT_S = 30.0
 
 
+# Reel videos are uploaded to Cloudinary; nothing else is ever a valid source.
+_ALLOWED_MEDIA_HOSTS = frozenset({"res.cloudinary.com"})
+
+
+def _allowed_media_host(url: str) -> str | None:
+    """Return the URL's host if it is an https Cloudinary delivery URL, else None."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or host not in _ALLOWED_MEDIA_HOSTS:
+        return None
+    if parts.username or parts.password or (parts.port not in (None, 443)):
+        return None
+    return host
+
+
+async def _download_capped(url: str, max_bytes: int) -> bytes | None:
+    """Stream `url` into memory, giving up as soon as it exceeds `max_bytes`.
+
+    No redirects (a redirect could point anywhere), Content-Length checked
+    before reading, and the body counted while streaming so a missing or lying
+    Content-Length can't make the service buffer a multi-GB file. Logs the
+    host only — the full URL can carry signed query parameters.
+    """
+    import httpx
+    from urllib.parse import urlsplit
+
+    host = urlsplit(url).hostname
+    try:
+        async with httpx.AsyncClient(
+            timeout=_VIDEO_DOWNLOAD_TIMEOUT_S, follow_redirects=False
+        ) as client:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    logger.warning(
+                        "generate_reel_captions: download from %s returned %d",
+                        host, resp.status_code,
+                    )
+                    return None
+                declared = resp.headers.get("content-length")
+                if declared and declared.isdigit() and int(declared) > max_bytes:
+                    logger.info(
+                        "generate_reel_captions: video on %s is %s bytes, over the %d cap — skipping",
+                        host, declared, max_bytes,
+                    )
+                    return None
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf.extend(chunk)
+                    if len(buf) > max_bytes:
+                        logger.info(
+                            "generate_reel_captions: video on %s exceeded the %d cap mid-download — skipping",
+                            host, max_bytes,
+                        )
+                        return None
+                return bytes(buf)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("generate_reel_captions: failed to download from %s: %s", host, exc)
+        return None
+
+
 def _vtt_timestamp(seconds: float) -> str:
     if seconds < 0:
         seconds = 0.0
@@ -478,27 +553,20 @@ async def generate_reel_captions(video_url: str) -> str | None:
     extracts the audio itself server-side — no local ffmpeg/audio-extraction
     step is needed here.
     """
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=_VIDEO_DOWNLOAD_TIMEOUT_S) as client:
-            resp = await client.get(video_url)
-            resp.raise_for_status()
-            video_bytes = resp.content
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("generate_reel_captions: failed to download %s: %s", video_url, exc)
+    host = _allowed_media_host(video_url)
+    if host is None:
+        # The URL is client-supplied at reel creation: without this, any
+        # string a client sent made this service fetch it (internal network
+        # addresses included). The backend validates too; this is the
+        # defense-in-depth copy.
+        logger.warning("generate_reel_captions: refusing non-Cloudinary video URL")
         return None
 
+    video_bytes = await _download_capped(video_url, _MAX_TRANSCRIBE_BYTES)
     if not video_bytes:
         return None
-    if len(video_bytes) > _MAX_TRANSCRIBE_BYTES:
-        logger.info(
-            "generate_reel_captions: %s is %d bytes, over the %d Whisper cap — skipping",
-            video_url, len(video_bytes), _MAX_TRANSCRIBE_BYTES,
-        )
-        return None
 
-    filename = video_url.rsplit("/", 1)[-1] or "reel.mp4"
+    filename = video_url.split("?", 1)[0].rsplit("/", 1)[-1] or "reel.mp4"
 
     try:
         if settings.llm_provider != "groq":
@@ -515,7 +583,7 @@ async def generate_reel_captions(video_url: str) -> str | None:
         logger.error("llm provider SDK is not installed")
         return None
     except Exception as exc:  # noqa: BLE001 — graceful degradation boundary
-        logger.error("generate_reel_captions transcription failed for %s: %s", video_url, exc)
+        logger.error("generate_reel_captions transcription failed (host %s): %s", host, exc)
         return None
 
     if not segments:

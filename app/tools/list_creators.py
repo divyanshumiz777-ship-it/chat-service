@@ -11,7 +11,7 @@ import logging
 
 from app.config import get_settings
 from app.core.mongo import get_db
-from app.tools._common import oid_set, to_oid
+from app.tools._common import active_account_filter, oid_set, to_oid
 
 settings = get_settings()
 logger = logging.getLogger(f"{settings.service_name}.list_creators")
@@ -61,7 +61,7 @@ async def _get_followed_creators_impl(user_id: str, limit: int) -> list[dict]:
     # predates a block (either direction) doesn't leak through. list_friends.py
     # already does this both-direction check; this tool previously did neither.
     creator_docs = await db["users"].find(
-        {"_id": {"$in": creator_oids}},
+        {"_id": {"$in": creator_oids}, **active_account_filter()},
         {"name": 1, "profilePic": 1, "about": 1, "blockedUsers": 1},
     ).to_list(length=len(creator_oids))
 

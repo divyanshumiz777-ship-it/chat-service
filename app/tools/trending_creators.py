@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import get_settings
 from app.core.mongo import get_db
-from app.tools._common import oid_set, to_oid
+from app.tools._common import active_account_filter, oid_set, to_oid
 
 settings = get_settings()
 logger = logging.getLogger(f"{settings.service_name}.trending_creators")
@@ -75,7 +75,7 @@ async def _get_trending_creators_impl(user_id: str, limit: int) -> list[dict]:
         return []
 
     creator_docs = await db["users"].find(
-        {"_id": {"$in": eligible_ids}},
+        {"_id": {"$in": eligible_ids}, **active_account_filter()},
         {"name": 1, "profilePic": 1, "about": 1},
     ).to_list(length=len(eligible_ids))
     profiles = {d["_id"]: d for d in creator_docs}

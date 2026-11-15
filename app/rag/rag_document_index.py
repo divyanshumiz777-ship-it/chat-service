@@ -72,3 +72,13 @@ async def delete_index_entries(source_type: str, source_id: str) -> None:
     collection has no server_id/channel_id field to bulk-match on anyway.
     """
     await _coll().delete_many({"source_type": source_type, "source_id": source_id})
+
+
+async def delete_index_entries_many(source_type: str, source_ids: list[str]) -> None:
+    """Bulk form of delete_index_entries for an explicit list of ids. A no-op
+    for an empty list (never a match-everything delete)."""
+    if not source_ids:
+        return
+    await _coll().delete_many(
+        {"source_type": source_type, "source_id": {"$in": list(source_ids)}}
+    )

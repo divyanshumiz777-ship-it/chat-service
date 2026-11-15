@@ -18,7 +18,7 @@ from collections import defaultdict
 
 from app.config import get_settings
 from app.core.mongo import get_db
-from app.tools._common import is_recent, oid_set, top_n, to_oid
+from app.tools._common import active_account_filter, is_recent, oid_set, top_n, to_oid
 
 settings = get_settings()
 logger = logging.getLogger(f"{settings.service_name}.creator_recommender")
@@ -110,7 +110,8 @@ async def suggest_creators(user_id: str, limit: int = 5) -> list[dict]:
 
     names: dict = {}
     async for u in db["users"].find(
-        {"_id": {"$in": list(stats.keys())}}, {"name": 1, "profilePic": 1, "blockedUsers": 1}
+        {"_id": {"$in": list(stats.keys())}, **active_account_filter()},
+        {"name": 1, "profilePic": 1, "blockedUsers": 1},
     ):
         # Reverse-block: this candidate has blocked me. My_blocked (candidate
         # blocked by me) is already excluded earlier via `excluded`.

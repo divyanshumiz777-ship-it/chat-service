@@ -10,13 +10,12 @@ LLM, it only retrieves what was already written to MongoDB.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 
 from app.config import get_settings
 from app.core.mongo import get_db
+from app.tools._access import resolve_channel_by_name
 from app.tools._common import to_oid
 
 settings = get_settings()
@@ -34,17 +33,6 @@ class VoiceSessionRecallData:
     action_items: list[str]
     ended_at: str | None
     participant_count: int
-
-
-# Mirrors community_summary.py's _can_view rule (public visible to all,
-# private visible only to members) — duplicated rather than imported since
-# each tool module here is deliberately self-contained.
-def _can_view(server: dict, user_oid: Any) -> bool:
-    if server.get("visibility") == "public":
-        return True
-    if user_oid is None:
-        return False
-    return any(m.get("user") == user_oid for m in (server.get("members") or []))
 
 
 async def get_voice_session_recall(
@@ -70,25 +58,18 @@ async def _voice_session_recall_impl(
     user_oid = to_oid(user_id)
     db = get_db()
 
-    channel = await db["channels"].find_one(
-        {"name": {"$regex": f"^{re.escape(channel_name)}$", "$options": "i"}},
-        {"name": 1, "server": 1},
+    # Shared resolver (app/tools/_access.py): the caller's own servers first,
+    # then public ones, voice/video channels preferred over a same-named text
+    # channel; servers the caller can't see are never returned.
+    resolved = await resolve_channel_by_name(
+        db, user_oid, channel_name, prefer_types=("Voice", "Video")
     )
-    if channel is None:
+    if resolved is None:
         return None
+    channel, server_doc, _is_member = resolved
 
     channel_oid = channel["_id"]
-    server_oid = channel.get("server")
-
-    server_doc: dict | None = None
-    if server_oid:
-        server_doc = await db["discordservers"].find_one(
-            {"_id": server_oid}, {"name": 1, "visibility": 1, "members": 1}
-        )
-    if server_doc and not _can_view(server_doc, user_oid):
-        return None
-
-    server_name = (server_doc or {}).get("name") or "Unknown Server"
+    server_name = server_doc.get("name") or "Unknown Server"
 
     session = await db["voicesessions"].find_one(
         {"channel": channel_oid, "status": "summarized"},

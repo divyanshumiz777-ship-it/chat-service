@@ -141,6 +141,41 @@ async def delete_by_fields(collection_name: str, conditions: dict[str, str]) -> 
     logger.debug("deleted points matching %s from %s", conditions, collection_name)
 
 
+async def scroll_source_ids(
+    collection_name: str, conditions: dict[str, str], batch: int = 256
+) -> list[str]:
+    """Return the payload `source_id` of every point matching ALL of
+    `conditions` — used to find which rag_index_state rows to clean up before
+    a filtered delete. Same empty-condition refusal as delete_by_fields."""
+    if not conditions or not all(conditions.values()):
+        raise ValueError("scroll_source_ids requires non-empty field=value conditions")
+
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    client = get_client()
+    filter_ = Filter(
+        must=[FieldCondition(key=k, match=MatchValue(value=v)) for k, v in conditions.items()]
+    )
+    ids: set[str] = set()
+    offset = None
+    while True:
+        points, offset = await client.scroll(
+            collection_name=collection_name,
+            scroll_filter=filter_,
+            limit=batch,
+            offset=offset,
+            with_payload=["source_id"],
+            with_vectors=False,
+        )
+        for p in points:
+            sid = (p.payload or {}).get("source_id")
+            if sid:
+                ids.add(str(sid))
+        if offset is None:
+            break
+    return sorted(ids)
+
+
 async def close_client() -> None:
     """Close the shared client (call on shutdown)."""
     global _client

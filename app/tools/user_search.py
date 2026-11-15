@@ -21,7 +21,7 @@ import re
 
 from app.config import get_settings
 from app.core.mongo import get_db
-from app.tools._common import oid_set, to_oid
+from app.tools._common import active_account_filter, oid_set, to_oid
 
 settings = get_settings()
 logger = logging.getLogger(f"{settings.service_name}.user_search")
@@ -49,7 +49,7 @@ async def _search_users_impl(user_id: str, term: str | None, limit: int) -> list
 
     db = get_db()
 
-    total_users = await db["users"].count_documents({})
+    total_users = await db["users"].estimated_document_count()
     logger.info("USER=%s TERM=%r MONGO_TOTAL=%d", user_id, term, total_users)
 
     me = await db["users"].find_one(
@@ -79,6 +79,7 @@ async def _search_users_impl(user_id: str, term: str | None, limit: int) -> list
     query: dict = {
         "_id": {"$nin": list(excluded)},
         "$or": visibility_or,
+        **active_account_filter(),
     }
     if term:
         query["name"] = {"$regex": re.escape(term.strip()), "$options": "i"}
