@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import threading
 from typing import Any
 
 from app.config import get_settings
@@ -16,13 +17,21 @@ _CACHE_PREFIX = "chat:embed:"
 _model: Any | None = None
 
 
+# The startup warm-up (app.main) loads the model in a worker thread while
+# requests may already be arriving; without the lock a search during warm-up
+# would load a second copy (seconds of CPU and ~100MB of RAM on a small box).
+_model_lock = threading.Lock()
+
+
 def get_model() -> Any:
     global _model
     if _model is None:
-        from sentence_transformers import SentenceTransformer
+        with _model_lock:
+            if _model is None:
+                from sentence_transformers import SentenceTransformer
 
-        logger.info("loading embedding model %s", settings.embedding_model)
-        _model = SentenceTransformer(settings.embedding_model)
+                logger.info("loading embedding model %s", settings.embedding_model)
+                _model = SentenceTransformer(settings.embedding_model)
     return _model
 
 

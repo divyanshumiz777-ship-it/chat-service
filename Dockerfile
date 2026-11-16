@@ -23,6 +23,16 @@ RUN useradd --create-home --uid 1000 appuser
 COPY --from=deps /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=deps /usr/local/bin /usr/local/bin
 
+# Bake the embedding model into the image. Without this, every cold start on
+# Render (a fresh container each time) downloaded ~90MB from HuggingFace
+# before the first search could run. Must match EMBEDDING_MODEL (app/config.py
+# default); a different model at runtime still works, it just downloads.
+ENV HF_HOME=/app/.cache/huggingface
+ARG EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+RUN mkdir -p "$HF_HOME" \
+    && python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${EMBEDDING_MODEL}')" \
+    && chown -R appuser:appuser /app/.cache
+
 # Application code.
 COPY --chown=appuser:appuser app ./app
 COPY --chown=appuser:appuser content ./content

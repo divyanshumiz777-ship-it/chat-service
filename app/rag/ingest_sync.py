@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 import uuid
 from dataclasses import dataclass
@@ -49,6 +50,20 @@ class IngestResult:
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
+
+# Rebuild mode (ingest_all(rebuild=True)): ignore rag_index_state's "already
+# embedded" hashes. Those rows describe vectors in whatever Qdrant cluster was
+# last indexed; after moving to a new (empty) cluster every row is stale, and
+# honouring them would skip nearly everything. A context variable rather than
+# a parameter on every source function; upserts still refresh the rows.
+_rebuild: contextvars.ContextVar[bool] = contextvars.ContextVar("rag_rebuild", default=False)
+
+
+async def _existing_hashes(source_type: str, source_ids: list[str]) -> dict:
+    if _rebuild.get():
+        return {}
+    return await get_existing_hashes(source_type, source_ids)
+
 
 def _point_id(source_id: str, chunk_index: int) -> str:
     """Deterministic UUID-v5 so the same chunk always maps to the same Qdrant point."""
@@ -194,7 +209,7 @@ async def ingest_servers(
         return result
 
     source_ids = [str(d["_id"]) for d in docs]
-    existing = await get_existing_hashes("server", source_ids)
+    existing = await _existing_hashes("server", source_ids)
 
     raw_chunks = [c for d in docs for c in chunker.normalize_server(d)]
     result.docs = len(docs)
@@ -221,7 +236,7 @@ async def ingest_channels(
         list({d["server"] for d in docs if d.get("server")})
     )
     source_ids = [str(d["_id"]) for d in docs]
-    existing = await get_existing_hashes("channel", source_ids)
+    existing = await _existing_hashes("channel", source_ids)
 
     raw_chunks: list[RagChunk] = []
     for doc in docs:
@@ -252,7 +267,7 @@ async def ingest_threads(
         list({d["server"] for d in docs if d.get("server")})
     )
     source_ids = [str(d["_id"]) for d in docs]
-    existing = await get_existing_hashes("thread", source_ids)
+    existing = await _existing_hashes("thread", source_ids)
 
     raw_chunks: list[RagChunk] = []
     for doc in docs:
@@ -300,7 +315,7 @@ async def ingest_reels(
         return result
 
     source_ids = [str(d["_id"]) for d in docs]
-    existing = await get_existing_hashes("reel", source_ids)
+    existing = await _existing_hashes("reel", source_ids)
 
     raw_chunks = [c for d in docs for c in chunker.normalize_reel(d)]
     result.chunks = len(raw_chunks)
@@ -369,7 +384,7 @@ async def ingest_users(
     # match on profileVisibility == "public", so the branch could never fire.)
 
     source_ids = [str(d["_id"]) for d in docs]
-    existing = await get_existing_hashes("user", source_ids)
+    existing = await _existing_hashes("user", source_ids)
 
     raw_chunks = [c for d in docs for c in chunker.normalize_user(d)]
     result.chunks = len(raw_chunks)
@@ -427,7 +442,7 @@ async def ingest_messages(
             group_meta[str(g["_id"])] = [str(p) for p in g.get("participants", [])]
 
     source_ids = [str(d["_id"]) for d in docs]
-    existing = await get_existing_hashes("message", source_ids)
+    existing = await _existing_hashes("message", source_ids)
 
     raw_chunks: list[RagChunk] = []
     for doc in channel_docs:
@@ -661,7 +676,7 @@ async def ingest_voice_sessions(
         list({d["channel"] for d in docs if d.get("channel")})
     )
     source_ids = [str(d["_id"]) for d in docs]
-    existing = await get_existing_hashes("voice_session", source_ids)
+    existing = await _existing_hashes("voice_session", source_ids)
 
     raw_chunks: list[RagChunk] = []
     for doc in docs:
@@ -693,7 +708,7 @@ async def ingest_notifications(
         return result
 
     source_ids = [str(d["_id"]) for d in docs]
-    existing = await get_existing_hashes("notification", source_ids)
+    existing = await _existing_hashes("notification", source_ids)
 
     raw_chunks = [c for d in docs for c in chunker.normalize_notification(d)]
     result.docs = len(docs)
@@ -704,8 +719,18 @@ async def ingest_notifications(
     return result
 
 
-async def ingest_all(since: datetime | None = None) -> dict[str, Any]:
-    logger.info("ingest_all started (since=%s)", since)
+async def ingest_all(since: datetime | None = None, rebuild: bool = False) -> dict[str, Any]:
+    """Index every source. `rebuild=True` re-embeds everything regardless of
+    rag_index_state — use it after pointing QDRANT_URL at a new cluster."""
+    logger.info("ingest_all started (since=%s, rebuild=%s)", since, rebuild)
+    token = _rebuild.set(rebuild)
+    try:
+        return await _ingest_all(since)
+    finally:
+        _rebuild.reset(token)
+
+
+async def _ingest_all(since: datetime | None) -> dict[str, Any]:
 
     results: list[dict[str, Any]] = []
 

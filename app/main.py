@@ -5,6 +5,7 @@ layer, and a metadata root. RAG (Qdrant + SentenceTransformers), Gemini,
 ingestion, and the gateway/search endpoints are introduced in later batches.
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -25,25 +26,36 @@ logger = logging.getLogger(settings.service_name)
 
 from app.rag.qdrant_client import bootstrap_collections
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    logger.info(
-        "starting %s (env=%s)",
-        settings.service_name,
-        settings.environment,
-    )
+
+async def _warm_up() -> None:
+    """Everything the service used to do BEFORE accepting requests.
+
+    It now runs in the background right after the server starts listening, so
+    a cold start (Render free tier) is answering within seconds instead of
+    holding every request until setup finished. Each step is independent and
+    never raises: a request arriving mid-warm-up just does that work itself
+    (the embedding model loads once — see embedder.get_model's lock).
+    """
     try:
         await bootstrap_collections()
         logger.info("Qdrant collections initialized")
     except Exception as exc:
         logger.error("Failed to initialize Qdrant: %s", exc)
 
-    # Product help is a small, static, version-controlled corpus, so index it on
-    # every start rather than relying on someone triggering an ingest. Without
-    # this, "how do I create a community?" depends on an operational step that
-    # nothing enforces — and the whole reason product help exists is that the
-    # assistant used to refuse those questions outright. Embeddings are
-    # content-hash cached, so repeat startups are nearly free.
+    # Load the embedding model now, off the event loop, so the first real
+    # search doesn't pay for it (torch import + model load is the slow part
+    # of a cold start).
+    try:
+        from app.rag.embedder import get_model
+
+        await asyncio.to_thread(get_model)
+        logger.info("embedding model ready")
+    except Exception as exc:
+        logger.error("Failed to load the embedding model: %s", exc)
+
+    # Product help is a small, static, version-controlled corpus, so index it
+    # on every start rather than relying on someone triggering an ingest.
+    # Embeddings are content-hash cached, so repeat startups are nearly free.
     try:
         from app.rag.ingest_sync import ingest_docs
 
@@ -52,10 +64,21 @@ async def lifespan(_app: FastAPI):
             "product help ready: %d topic(s), %d chunk(s)", result.docs, result.chunks
         )
     except Exception as exc:
-        # Never block startup: every non-help capability still works without it.
+        # Never fatal: every non-help capability still works without it.
         logger.error("Failed to index product help: %s", exc)
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    logger.info(
+        "starting %s (env=%s)",
+        settings.service_name,
+        settings.environment,
+    )
+    warm_up = asyncio.create_task(_warm_up()) if settings.startup_warmup else None
     yield
+    if warm_up is not None and not warm_up.done():
+        warm_up.cancel()
     logger.info("shutting down %s", settings.service_name)
 
 app = FastAPI(
